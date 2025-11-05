@@ -1,0 +1,114 @@
+import json, os, time, requests
+from dotenv import load_dotenv
+from telegram import ReplyKeyboardMarkup
+from telegram.ext import Updater, MessageHandler, Filters
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = str(os.getenv("CHAT_ID", "")).strip()
+THRESHOLD_PCT = float(os.getenv("THRESHOLD_PCT", "1.0"))
+
+DATA_FILE = "portfolio.json"
+UPBIT = "https://api.upbit.com/v1/ticker?markets="
+
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {"coins": {}, "default_threshold_pct": THRESHOLD_PCT}
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_data(d):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+
+data = load_data()
+
+def get_price(symbol):
+    if "-" not in symbol:
+        symbol = "KRW-" + symbol.upper()
+    r = requests.get(UPBIT + symbol)
+    return float(r.json()[0]["trade_price"])
+
+def format_number(n): return f"{n:,.0f}"
+
+def check_notify(context):
+    for sym, info in data["coins"].items():
+        try:
+            cur = get_price(sym)
+        except:
+            continue
+        base = info.get("last_notified_price", cur)
+        th = info.get("threshold_pct", data["default_threshold_pct"])
+        if abs(cur/base-1)*100 >= th:
+            msg = f"🚨 {sym} 변동 {th}% 초과\n기준: {format_number(base)} → 현재: {format_number(cur)}"
+            context.bot.send_message(chat_id=CHAT_ID, text=msg)
+            info["last_notified_price"] = cur
+            save_data(data)
+
+def message(update, context):
+    if CHAT_ID and str(update.effective_chat.id) != CHAT_ID:
+        return
+    text = update.message.text.strip().replace("  ", " ")
+    parts = text.split()
+    if not parts: return
+    cmd = parts[0].lstrip("/")
+    args = parts[1:]
+    kb = ReplyKeyboardMarkup([["상태","도움말"],["추가","삭제","가격"],["임계값","평단","수량"]], resize_keyboard=True)
+    if cmd in ["도움말","help"]:
+        update.message.reply_text("명령: 추가, 삭제, 평단, 수량, 임계값, 가격, 상태", reply_markup=kb)
+    elif cmd in ["상태","show"]:
+        text=""
+        for sym,info in data["coins"].items():
+            cur=get_price(sym)
+            avg=info.get("avg_price",0)
+            qty=info.get("qty",0)
+            text+=f"{sym} / {format_number(avg)} / {qty} / {format_number(cur)}\n"
+        update.message.reply_text(text or "등록된 코인 없음", reply_markup=kb)
+    elif cmd=="추가":
+        if not args: update.message.reply_text("예) 추가 BTC", reply_markup=kb); return
+        sym="KRW-"+args[0].upper(); data["coins"][sym]={}; save_data(data)
+        update.message.reply_text(f"{sym} 추가됨", reply_markup=kb)
+    elif cmd=="삭제":
+        if not args: update.message.reply_text("예) 삭제 BTC", reply_markup=kb); return
+        sym="KRW-"+args[0].upper()
+        data["coins"].pop(sym,None); save_data(data)
+        update.message.reply_text(f"{sym} 삭제됨", reply_markup=kb)
+    elif cmd=="평단":
+        if len(args)<2: update.message.reply_text("예) 평단 BTC 95000000", reply_markup=kb); return
+        sym="KRW-"+args[0].upper()
+        data["coins"].setdefault(sym,{})["avg_price"]=float(args[1]); save_data(data)
+        update.message.reply_text(f"{sym} 평단 설정 완료", reply_markup=kb)
+    elif cmd=="수량":
+        if len(args)<2: update.message.reply_text("예) 수량 BTC 0.1", reply_markup=kb); return
+        sym="KRW-"+args[0].upper()
+        data["coins"].setdefault(sym,{})["qty"]=float(args[1]); save_data(data)
+        update.message.reply_text(f"{sym} 수량 설정 완료", reply_markup=kb)
+    elif cmd=="임계값":
+        if len(args)==1:
+            data["default_threshold_pct"]=float(args[0]); save_data(data)
+            update.message.reply_text(f"기본 임계값 {args[0]}%", reply_markup=kb)
+        elif len(args)==2:
+            sym="KRW-"+args[0].upper()
+            data["coins"].setdefault(sym,{})["threshold_pct"]=float(args[1]); save_data(data)
+            update.message.reply_text(f"{sym} 개별 임계값 {args[1]}%", reply_markup=kb)
+        else:
+            update.message.reply_text("예) 임계값 1.0 또는 임계값 BTC 0.5", reply_markup=kb)
+    elif cmd=="가격":
+        if not args: update.message.reply_text("예) 가격 BTC", reply_markup=kb); return
+        sym="KRW-"+args[0].upper(); p=get_price(sym)
+        update.message.reply_text(f"{sym} 현재가 {format_number(p)}원", reply_markup=kb)
+    else:
+        update.message.reply_text("도움말", reply_markup=kb)
+
+def main():
+    if not BOT_TOKEN: print("BOT_TOKEN 누락"); return
+    u=Updater(BOT_TOKEN, use_context=True)
+    dp=u.dispatcher
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, message))
+    dp.add_handler(MessageHandler(Filters.command, message))
+    u.job_queue.run_repeating(check_notify, interval=3, first=5)
+    u.start_polling(); u.idle()
+
+if __name__=="__main__":
+    main()
+

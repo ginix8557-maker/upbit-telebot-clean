@@ -1,0 +1,36 @@
+{
+  "default_threshold_pct": 0.1,
+  "coins": {
+    "KRW-SOL": {
+      "avg_price": 289263.0,
+      "qty": 89.80100443,
+      "last_notified_price": 232600.0,
+      "threshold_pct": 0.5,
+      "target_price": null
+    },
+    "KRW-XRP": {
+      "avg_price": 4131.1,
+      "qty": 2183.33692558,
+      "threshold_pct": 0.5,
+      "last_notified_price": 3322.0
+    },
+    "KRW-TRX": {
+      "avg_price": 0.0,
+      "qty": 0.0,
+      "threshold_pct": 1.0,
+      "last_notified_price": 424.0
+    }
+  },
+  "rsi": {
+    "period": 14,
+    "overbought": 70,
+    "oversold": 30,
+    "cooldown_min": 15,
+    "last_signal_ts": {}
+  },
+  "notify": {
+    "poll_interval_sec": 2,
+    "last_push_ts": {}
+  },
+  "pending": {}
+}
