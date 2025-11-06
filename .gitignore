@@ -1,7 +1,5 @@
-venv/
-.env
 __pycache__/
-*.pyc
+.env
+*.lock
 *.log
-bot.lock
-portfolio.json
+
