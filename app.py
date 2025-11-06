@@ -17,27 +17,40 @@ LOCK_FILE = "bot.lock"
 UPBIT     = "https://api.upbit.com/v1"
 
 # ========== KEEPALIVE ==========
-# (501 방지: HTTP/1.1 + Content-Length 명시, 예외 시 500 반환)
+# (501 방지 보강: HTTP/1.1 + Content-Length 명시 + do_HEAD 처리)
 class _Ok(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def _send_ok(self):
+        body = b"OK"
+        self.send_response(200)
+        self.send_header("Content-Type","text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except:  # 헤더만 필요한 경우도 있어 write 실패 무시
+            pass
+
     def do_GET(self):
         try:
-            body = b"OK"
-            self.send_response(200)
-            self.send_header("Content-Type","text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_ok()
         except Exception as e:
-            try:
-                err = str(e).encode("utf-8")
-                self.send_response(500)
-                self.send_header("Content-Type","text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(err)))
-                self.end_headers()
-                self.wfile.write(err)
-            except:
-                pass
+            err = str(e).encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type","text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(err)))
+            self.end_headers()
+            try: self.wfile.write(err)
+            except: pass
+
+    def do_HEAD(self):
+        # 일부 리전/모니터가 HEAD로 상태 확인 → 501 방지
+        self.send_response(200)
+        self.send_header("Content-Type","text/plain; charset=utf-8")
+        self.send_header("Content-Length","2")
+        self.end_headers()
+
     def log_message(self, *a, **k): return
 
 def _start_keepalive():
