@@ -3,19 +3,77 @@ on:
   schedule:
     - cron: "*/10 * * * *"   # 10분마다
   workflow_dispatch:
+
 concurrency:
   group: keepalive
   cancel-in-progress: true
+
 permissions:
   contents: read
+
+env:
+  # 기본값: 저장소 변수가 없으면 이 값 사용
+  RENDER_URL: ${{ vars.RENDER_URL || 'https://upbit-telebot-clean.onrender.com/' }}
+  # 선택: 성공 시에도 알림 보내려면 저장소 변수 ENABLE_SUCCESS_NOTIFY=true 로 설정
+  ENABLE_SUCCESS_NOTIFY: ${{ vars.ENABLE_SUCCESS_NOTIFY || 'false' }}
+  # 선택: 알림 접두사(브랜드명 등)
+  ALERT_PREFIX: ${{ vars.ALERT_PREFIX || '' }}
+  # 네트워크 튜닝
+  CURL_TIMEOUT: "7"     # 초
+  RETRIES: "3"          # 재시도 횟수
+
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Render (GET /)
+      - name: Ping Render with retries
+        id: ping
+        shell: bash
         run: |
-          for i in 1 2 3; do
-            curl -A "keepalive-gh-actions" -fsS https://upbit-telebot-clean.onrender.com/ && exit 0
+          url="${RENDER_URL%/}/"   # 보장된 슬래시
+          ok=1
+          for i in $(seq 1 "${RETRIES}"); do
+            start=$(date +%s%3N)
+            code=$(curl -A "keepalive-gh-actions" -s -o /dev/null -w "%{http_code}" --max-time "${CURL_TIMEOUT}" "$url") || code=000
+            end=$(date +%s%3N)
+            ms=$((end-start))
+            echo "try#$i -> $url => HTTP $code (${ms}ms)"
+            if [ "$code" = "200" ]; then
+              echo "http_code=$code" >> "$GITHUB_OUTPUT"
+              echo "latency_ms=$ms" >> "$GITHUB_OUTPUT"
+              ok=0
+              break
+            fi
             sleep 5
           done
-          echo "Ping failed (3 tries)"; exit 0
+          exit $ok
+
+      - name: Telegram alert on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          URL:      ${{ env.RENDER_URL }}
+          PREFIX:   ${{ env.ALERT_PREFIX }}
+        run: |
+          prefix="${PREFIX:+$PREFIX }"
+          msg="${prefix}🚨 Render ping 실패\nURL: ${URL}\nWorkflow: ${GITHUB_WORKFLOW} (#${GITHUB_RUN_NUMBER})\nBranch: ${GITHUB_REF_NAME}"
+          curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT}" \
+            --data-urlencode text="${msg}" >/dev/null || true
+
+      - name: Telegram notice on success (optional)
+        if: success() && env.ENABLE_SUCCESS_NOTIFY == 'true'
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          URL:      ${{ env.RENDER_URL }}
+          PREFIX:   ${{ env.ALERT_PREFIX }}
+          PING_MS:  ${{ steps.ping.outputs.latency_ms }}
+        run: |
+          prefix="${PREFIX:+$PREFIX }"
+          ms="${PING_MS:-N/A}"
+          msg="${prefix}✅ Render ping OK (${ms}ms)\nURL: ${URL}\nWorkflow: ${GITHUB_WORKFLOW} (#${GITHUB_RUN_NUMBER})"
+          curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT}" \
+            --data-urlencode text="${msg}" >/dev/null || true
