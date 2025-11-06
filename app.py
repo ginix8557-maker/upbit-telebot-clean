@@ -17,24 +17,25 @@ LOCK_FILE = "bot.lock"
 UPBIT     = "https://api.upbit.com/v1"
 
 # ========== KEEPALIVE ==========
+# (501 방지: HTTP/1.1 + Content-Length 명시, 예외 시 500 반환)
 class _Ok(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     def do_GET(self):
         try:
-            # 일부 리전에서 헤더 엄격 → 명시적 200/헤더/바디
+            body = b"OK"
             self.send_response(200)
             self.send_header("Content-Type","text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b"OK")
+            self.wfile.write(body)
         except Exception as e:
-            # 예외 시 500으로 반환(디버그에 도움)
             try:
+                err = str(e).encode("utf-8")
                 self.send_response(500)
                 self.send_header("Content-Type","text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(err)))
                 self.end_headers()
-            except:
-                pass
-            try:
-                self.wfile.write(str(e).encode("utf-8"))
+                self.wfile.write(err)
             except:
                 pass
     def log_message(self, *a, **k): return
@@ -45,8 +46,7 @@ def _start_keepalive():
         try:
             httpd = HTTPServer(("", PORT), _Ok)
             httpd.serve_forever()
-        except Exception as e:
-            print(f"[KEEPALIVE] error: {e}")
+        except: pass
     threading.Thread(target=_run, daemon=True).start()
 
 # ========== LOCK ==========
