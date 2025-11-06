@@ -4,7 +4,7 @@
     "KRW-SOL": {
       "avg_price": 289263.0,
       "qty": 89.80100443,
-      "last_notified_price": 238000.0,
+      "last_notified_price": 238600.0,
       "threshold_pct": 0.2,
       "target_price": null,
       "triggers": [
@@ -13,15 +13,15 @@
         250000.0,
         250000.0
       ],
-      "prev_price": 238200.0
+      "prev_price": 238500.0
     },
     "KRW-XRP": {
       "avg_price": 4131.1,
       "qty": 2183.33692558,
       "threshold_pct": 0.5,
-      "last_notified_price": 3482.0,
+      "last_notified_price": 3456.0,
       "triggers": [],
-      "prev_price": 3481.0
+      "prev_price": 3455.0
     },
     "KRW-TRX": {
       "avg_price": 420.0,
@@ -36,7 +36,7 @@
       "qty": 0.0,
       "threshold_pct": 0.2,
       "last_notified_price": 154346000.0,
-      "prev_price": 154570000.0,
+      "prev_price": 154101000.0,
       "triggers": []
     }
   },
