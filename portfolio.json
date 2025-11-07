@@ -13,7 +13,7 @@
         250000.0,
         250000.0
       ],
-      "prev_price": 238500.0
+      "prev_price": 238400.0
     },
     "KRW-XRP": {
       "avg_price": 4131.1,
@@ -21,7 +21,7 @@
       "threshold_pct": 0.5,
       "last_notified_price": 3456.0,
       "triggers": [],
-      "prev_price": 3455.0
+      "prev_price": 3456.0
     },
     "KRW-TRX": {
       "avg_price": 420.0,
@@ -29,14 +29,14 @@
       "threshold_pct": 1.0,
       "last_notified_price": 429.0,
       "triggers": [],
-      "prev_price": 430.0
+      "prev_price": 431.0
     },
     "KRW-BTC": {
       "avg_price": 0.0,
       "qty": 0.0,
       "threshold_pct": 0.2,
       "last_notified_price": 154346000.0,
-      "prev_price": 154101000.0,
+      "prev_price": 154435000.0,
       "triggers": []
     }
   },
