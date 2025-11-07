@@ -29,7 +29,8 @@ class _Ok(BaseHTTPRequestHandler):
             self.wfile.write(b"OK")
         except:
             pass
-    def log_message(self, *a, **k):  # access 로그 억제
+
+    def log_message(self, *a, **k):
         return
 
 def _start_keepalive():
@@ -53,7 +54,7 @@ def _pid_alive(pid:int) -> bool:
 
 def _acquire_lock():
     """
-    Persistent Disk(/data)에 lock 파일을 두고,
+    /data(또는 DATA_DIR)에 lock 파일을 두고,
     - 살아있는 PID가 있으면 즉시 종료 (중복 실행 방지)
     - 죽은 PID면 lock 재사용
     """
@@ -82,7 +83,6 @@ def _setup_signals():
         try:
             signal.signal(sig, lambda *_: (_release_lock(), exit(0)))
         except:
-            # 일부 환경에서 signal 설정이 제한될 수 있음
             pass
 
 _acquire_lock()
@@ -103,7 +103,7 @@ def load_state():
     d.setdefault("default_threshold_pct", DEFAULT_THRESHOLD)
     d.setdefault("pending", {})
 
-    # 과거 target/stop 필드 마이그레이션
+    # 과거 target/stop 필드 마이그레이션 (존재 시 triggers로 이동)
     changed = False
     for m, info in d["coins"].items():
         info.setdefault("triggers", [])
@@ -135,7 +135,7 @@ def save_state():
 
 state = load_state()
 
-# .env 기본값을 항상 반영 (파일에 과거 값이 있어도 최신 DEFAULT_THRESHOLD 우선)
+# .env 기본값 동기화
 if float(state.get("default_threshold_pct", DEFAULT_THRESHOLD)) != float(DEFAULT_THRESHOLD):
     state["default_threshold_pct"] = float(DEFAULT_THRESHOLD)
     save_state()
@@ -149,8 +149,16 @@ def MAIN_KB():
         resize_keyboard=True
     )
 
-COIN_MODE_KB = ReplyKeyboardMarkup([["추가","삭제"],["취소"]], resize_keyboard=True, one_time_keyboard=True)
-CANCEL_KB    = ReplyKeyboardMarkup([["취소"]], resize_keyboard=True, one_time_keyboard=True)
+COIN_MODE_KB = ReplyKeyboardMarkup(
+    [["추가","삭제"],["취소"]],
+    resize_keyboard=True,
+    one_time_keyboard=True
+)
+CANCEL_KB = ReplyKeyboardMarkup(
+    [["취소"]],
+    resize_keyboard=True,
+    one_time_keyboard=True
+)
 
 def coin_kb(include_cancel=True):
     syms = [m.split("-")[1] for m in state["coins"].keys()] or ["BTC","ETH","SOL"]
@@ -158,18 +166,6 @@ def coin_kb(include_cancel=True):
     if include_cancel:
         rows.append(["취소"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
-
-def trigger_menu_kb():
-    return ReplyKeyboardMarkup(
-        [["추가","삭제","목록"],["초기화","취소"]],
-        resize_keyboard=True, one_time_keyboard=True
-    )
-
-def trigger_add_mode_kb():
-    return ReplyKeyboardMarkup(
-        [["직접가격","현재가±%","평단가±%"],["취소"]],
-        resize_keyboard=True, one_time_keyboard=True
-    )
 
 # ========= UTIL =========
 def only_owner(update):
@@ -186,10 +182,13 @@ def fmt(n):
     except:
         return str(n)
 
-def get_price(market):
+def get_ticker(market):
     r = requests.get(f"{UPBIT}/ticker", params={"markets": market}, timeout=5)
     r.raise_for_status()
-    return float(r.json()[0]["trade_price"])
+    return r.json()[0]
+
+def get_price(market):
+    return float(get_ticker(market)["trade_price"])
 
 def norm_threshold(th):
     if th is None:
@@ -200,7 +199,7 @@ def norm_threshold(th):
         return float(state.get("default_threshold_pct", DEFAULT_THRESHOLD))
 
 # 이모지 규칙
-# 수익중 = 🔴, 손실중 = 🔵, 단순 추가 = ⚪️(avg=0, qty=0), 평단만 입력 = 🟡(avg>0, qty=0)
+# 수익중 = 🔴, 손실중 = 🔵, 단순 추가 = ⚪️, 평단만 입력 = 🟡
 def status_emoji(info, cur):
     avg = float(info.get("avg_price", 0.0))
     qty = float(info.get("qty", 0.0))
@@ -211,6 +210,14 @@ def status_emoji(info, cur):
     if avg <= 0:
         return "⚪️"
     return "🔴" if cur > avg else "🔵"
+
+def reply(update, text, kb=None):
+    update.message.reply_text(text, reply_markup=(kb or MAIN_KB()))
+
+def send_ctx(ctx, text):
+    if not CHAT_ID:
+        return
+    ctx.bot.send_message(chat_id=CHAT_ID, text=text, reply_markup=MAIN_KB())
 
 def pretty_sym(sym: str) -> str:
     sym = sym.upper()
@@ -223,13 +230,41 @@ def pretty_sym(sym: str) -> str:
     e = status_emoji(info, cur) if info else "⚪️"
     return f"{e} {sym} {e}"
 
-def reply(update, text, kb=None):
-    update.message.reply_text(text, reply_markup=(kb or MAIN_KB()))
+# ========= 정렬 로직 =========
+def sorted_coin_items():
+    """
+    1순위: qty > 0 (보유)          → 매수총액(avg*qty) 내림차순
+    2순위: avg > 0, qty == 0      → 24h 거래대금 내림차순
+    3순위: 그 외(단순 추가 등)    → 24h 거래대금 내림차순
+    """
+    items = []
+    for m, info in state["coins"].items():
+        try:
+            t = get_ticker(m)
+            cur = float(t.get("trade_price", 0.0))
+            vol = float(t.get("acc_trade_price_24h", 0.0))
+        except:
+            cur = 0.0
+            vol = 0.0
 
-def send_ctx(ctx, text):
-    if not CHAT_ID:
-        return
-    ctx.bot.send_message(chat_id=CHAT_ID, text=text, reply_markup=MAIN_KB())
+        avg = float(info.get("avg_price", 0.0))
+        qty = float(info.get("qty", 0.0))
+
+        if qty > 0:
+            group = 1
+            primary = -(avg * qty)  # 매수총액 큰 순
+        elif avg > 0:
+            group = 2
+            primary = -vol
+        else:
+            group = 3
+            primary = -vol
+
+        items.append((group, primary, m, info, cur))
+
+    # group asc, primary asc(음수라 desc 효과), 심볼명 asc
+    items.sort(key=lambda x: (x[0], x[1], x[2]))
+    return items
 
 # ========= SUMMARY / FORMATTERS =========
 def format_triggers(info):
@@ -253,14 +288,17 @@ def view_block(mkt, info, cur):
     sym = mkt.split("-")[1]
     avg = float(info.get("avg_price", 0.0))
     qty = float(info.get("qty", 0.0))
-    buy_amt = avg * qty
+    buy_amt = avg * qty  # 매수총액
     pnl_p = 0.0 if avg == 0 else (cur/avg - 1) * 100
     pnl_w = (cur - avg) * qty
     th    = norm_threshold(info.get("threshold_pct", None))
     trig  = format_triggers(info)
     head  = f"{pretty_sym(sym)}"
     line1 = f"{sym}  평단가:{fmt(avg)}  보유수량:{qty}  매수금액:{fmt(buy_amt)}"
-    line2 = f"현재가:{fmt(cur)}  평가손익({pnl_p:+.2f}%)  평가금액:{fmt(pnl_w)}  임계:{th}  트리거:[{trig}]"
+    line2 = (
+        f"현재가:{fmt(cur)}  평가손익({pnl_p:+.2f}%)  "
+        f"평가금액:{fmt(pnl_w)}  임계:{th}  트리거:[{trig}]"
+    )
     return head + "\n" + line1 + "\n" + line2
 
 # ========= RANDOM HOTEL REVIEW ( /호텔 ) =========
@@ -318,22 +356,12 @@ REVIEWS = [
 ]
 
 def _expand_braces(text: str) -> str:
-    """
-    {a|b|c} 형태를 랜덤으로 하나 선택해서 치환.
-    """
     def repl(match):
         options = match.group(1).split("|")
         return random.choice(options).strip()
     return re.sub(r"{([^}]+)}", repl, text)
 
 def build_random_hotel_review() -> str:
-    """
-    10개 문단 중에서
-    - 1번째 줄: 랜덤 문단의 1번째 줄
-    - 2번째 줄: 랜덤 문단의 2번째 줄
-    - 3번째 줄: 랜덤 문단의 3번째 줄
-    조합 후 {..|..} 패턴 랜덤 치환.
-    """
     line1 = _expand_braces(random.choice(REVIEWS)[0])
     line2 = _expand_braces(random.choice(REVIEWS)[1])
     line3 = _expand_braces(random.choice(REVIEWS)[2])
@@ -342,14 +370,13 @@ def build_random_hotel_review() -> str:
 HELP = (
     "📖 도움말\n"
     "• 버튼으로 실행\n"
-    "• 보기: 보유 현황\n"
+    "• 보기: 보유 현황 (보유 코인 매수총액 순 정렬)\n"
     "• 상태: 전체 설정\n"
     "• 코인: 추가/삭제\n"
-    "• 지정가: 트리거 추가/삭제/목록/초기화 (가격 관통 시 1회 알림 후 삭제)\n"
+    "• 지정가: 트리거 추가/삭제/목록/초기화\n"
     "\n"
-    "💬 명령어 추가 기능\n"
-    "• /호텔 : 두젠틀 후기용 3줄 랜덤 문장 생성\n"
-    "          (10개 문단에서 줄 단위 + {단어|랜덤} 조합)"
+    "💬 명령어\n"
+    "• /호텔 : 두젠틀 후기용 3줄 랜덤 문장 생성"
 )
 
 # ========= PENDING =========
@@ -381,13 +408,15 @@ def ensure_coin(m):
 
 def act_add(update, symbol):
     m = krw_symbol(symbol)
-    ensure_coin(m); save_state()
+    ensure_coin(m)
+    save_state()
     reply(update, f"추가 완료: {pretty_sym(m.split('-')[1])}")
 
 def act_del(update, symbol):
     m = krw_symbol(symbol)
     if m in state["coins"]:
-        state["coins"].pop(m); save_state()
+        state["coins"].pop(m)
+        save_state()
         reply(update, f"삭제 완료: {pretty_sym(m.split('-')[1])}")
     else:
         reply(update, "해당 코인이 없습니다.")
@@ -403,23 +432,27 @@ def act_price(update, symbol):
 def act_setavg(update, symbol, value):
     m = krw_symbol(symbol)
     c = ensure_coin(m)
-    c["avg_price"] = float(value); save_state()
+    c["avg_price"] = float(value)
+    save_state()
     reply(update, f"{pretty_sym(m.split('-')[1])} 평단 {fmt(value)} 원")
 
 def act_setqty(update, symbol, value):
     m = krw_symbol(symbol)
     c = ensure_coin(m)
-    c["qty"] = float(value); save_state()
+    c["qty"] = float(value)
+    save_state()
     reply(update, f"{pretty_sym(m.split('-')[1])} 수량 {value}")
 
 def act_setrate_default(update, value):
-    state["default_threshold_pct"] = float(value); save_state()
+    state["default_threshold_pct"] = float(value)
+    save_state()
     reply(update, f"기본 임계값 {value}%")
 
 def act_setrate_symbol(update, symbol, value):
     m = krw_symbol(symbol)
     c = ensure_coin(m)
-    c["threshold_pct"] = float(value); save_state()
+    c["threshold_pct"] = float(value)
+    save_state()
     reply(update, f"{pretty_sym(m.split('-')[1])} 개별 임계값 {value}%")
 
 # ========= TRIGGERS =========
@@ -444,7 +477,8 @@ def trigger_add(symbol, mode, value):
                 raise ValueError("평단가가 없습니다.")
         pct = float(value)
         target = base * (1 + pct/100.0)
-    c["triggers"].append(float(target)); save_state()
+    c["triggers"].append(float(target))
+    save_state()
     return target
 
 def trigger_delete(symbol, indices):
@@ -452,14 +486,16 @@ def trigger_delete(symbol, indices):
     c = ensure_coin(m)
     trigs = sorted(list(c.get("triggers", [])))
     kept = [v for i, v in enumerate(trigs, start=1) if i not in indices]
-    c["triggers"] = kept; save_state()
+    c["triggers"] = kept
+    save_state()
     return len(trigs) - len(kept)
 
 def trigger_clear(symbol):
     m = krw_symbol(symbol)
     c = ensure_coin(m)
     n = len(c.get("triggers", []))
-    c["triggers"] = []; save_state()
+    c["triggers"] = []
+    save_state()
     return n
 
 # ========= VIEW / STATUS =========
@@ -468,27 +504,23 @@ def send_view(update):
         reply(update, "등록된 코인이 없습니다. ‘코인 → 추가’로 등록하세요.")
         return
     lines = ["📊 보기"]
-    for m, info in state["coins"].items():
-        try:
-            cur = get_price(m)
-        except:
-            cur = 0.0
+    for _, _, m, info, cur in sorted_coin_items():
         lines.append(view_block(m, info, cur))
     reply(update, ("\n".join(lines))[:4000])
 
 def send_status(update):
     g = norm_threshold(state.get("default_threshold_pct", DEFAULT_THRESHOLD))
-    header = f"⚙️ 상태(전체 설정)\n- 기본 임계값: {g}%\n- 등록 코인 수: {len(state['coins'])}\n"
+    header = (
+        f"⚙️ 상태(전체 설정)\n"
+        f"- 기본 임계값: {g}%\n"
+        f"- 등록 코인 수: {len(state['coins'])}\n"
+    )
     if not state["coins"]:
         reply(update, header + "- 코인 없음")
         return
     rows = []
-    for m, c in state["coins"].items():
-        try:
-            cur = get_price(m)
-        except:
-            cur = 0.0
-        rows.append(status_line(m, c, cur))
+    for _, _, m, info, cur in sorted_coin_items():
+        rows.append(status_line(m, info, cur))
     reply(update, (header + "\n".join(rows))[:4000])
 
 # ========= ALERT LOOP =========
@@ -549,7 +581,8 @@ def check_loop(context):
                     sym = m.split("-")[1]
                     direction = "🔴 상향" if up_cross else "🔵 하향"
                     try:
-                        send_ctx(context,
+                        send_ctx(
+                            context,
                             f"🎯 트리거 도달\n{direction} {sym}: 현재 {fmt(cur)}원 | 트리거 {fmt(t)}원"
                         )
                     except:
@@ -573,10 +606,9 @@ def on_text(update, context):
     text = (update.message.text or "").strip()
     cid  = update.effective_chat.id
 
-    # /호텔 명령: 오직 명령어로만 동작, 키보드 X
+    # /호텔: 명령어로만 동작
     if text.startswith("/호텔") or text.lower().startswith("/hotel"):
-        msg = build_random_hotel_review()
-        update.message.reply_text(msg)
+        update.message.reply_text(build_random_hotel_review())
         return
 
     pend = get_pending(cid)
@@ -783,9 +815,9 @@ def main():
     _start_keepalive()
 
     if not BOT_TOKEN:
-        print("BOT_TOKEN 누락"); return
+        print("BOT_TOKEN 누락")
+        return
 
-    # Updater(polling)는 반드시 한 인스턴스만 사용해야 함
     up = Updater(BOT_TOKEN, use_context=True)
 
     try:
@@ -797,10 +829,8 @@ def main():
     dp.add_handler(MessageHandler(Filters.text & (~Filters.command), on_text))
     dp.add_handler(MessageHandler(Filters.command, on_text))
 
-    # 3초마다 업비트 감시
     up.job_queue.run_repeating(check_loop, interval=3, first=3)
 
-    # 시작 알림
     def hi(ctx):
         try:
             if CHAT_ID:
