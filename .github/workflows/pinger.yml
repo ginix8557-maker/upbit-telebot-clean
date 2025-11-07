@@ -2,7 +2,7 @@ name: Keep Render Alive
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 5분마다 실행
+    - cron: "*/5 * * * *"   # 5분마다
   workflow_dispatch:
 
 permissions:
@@ -10,20 +10,32 @@ permissions:
 
 env:
   RENDER_URL: ${{ vars.RENDER_URL || 'https://upbit-telebot-clean.onrender.com/' }}
+  MAX_RETRY: 3
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    timeout-minutes: 3
+
     steps:
-      - name: Ping Render
+      - name: Ping Render with retries
         id: ping
         run: |
           url="${RENDER_URL%/}/"
-          echo "Pinging $url"
-          code=$(curl -A "keepalive-gh-actions" -s -o /dev/null -w "%{http_code}" --max-time 7 "$url" || echo 000)
-          echo "HTTP $code"
-          if [ "$code" != "200" ]; then
+          echo "Target: $url"
+          ok=0
+          for i in $(seq 1 "$MAX_RETRY"); do
+            echo "try #$i"
+            code=$(curl -A "keepalive-gh-actions" -s -o /dev/null -w "%{http_code}" --max-time 25 "$url" || echo 000)
+            echo "HTTP $code"
+            if [ "$code" = "200" ]; then
+              ok=1
+              break
+            fi
+            sleep 10
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "Ping failed after ${MAX_RETRY} tries"
             exit 1
           fi
 
@@ -34,7 +46,7 @@ jobs:
           TG_CHAT:  ${{ secrets.TELEGRAM_CHAT_ID }}
           URL:      ${{ env.RENDER_URL }}
         run: |
-          msg="🚨 Render ping 실패\nURL: ${URL}\nWorkflow: ${GITHUB_WORKFLOW} (#${GITHUB_RUN_NUMBER})"
+          msg="🚨 Render ping 연속 실패\nURL: ${URL}\nWorkflow: ${GITHUB_WORKFLOW} (#${GITHUB_RUN_NUMBER})"
           curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -d chat_id="${TG_CHAT}" \
             --data-urlencode text="${msg}" >/dev/null || true
