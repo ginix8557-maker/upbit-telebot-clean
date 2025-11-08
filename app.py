@@ -456,24 +456,14 @@ def _expand_braces(text: str) -> str:
     return re.sub(r"{([^}]+)}", repl, text)
 
 def build_random_hotel_review() -> str:
-    """
-    10개 템플릿의 각 줄을 독립적으로 섞어서 3줄 후기 생성.
-    1줄: 모든 템플릿의 1번째 줄 중 랜덤
-    2줄: 모든 템플릿의 2번째 줄 중 랜덤
-    3줄: 모든 템플릿의 3번째 줄 중 랜덤
-    각 줄 안의 {...} 토큰도 랜덤 치환.
-    """
     if not REVIEWS:
         return ""
-
     first_lines  = [r[0] for r in REVIEWS]
     second_lines = [r[1] for r in REVIEWS]
     third_lines  = [r[2] for r in REVIEWS]
-
     line1 = _expand_braces(random.choice(first_lines))
     line2 = _expand_braces(random.choice(second_lines))
     line3 = _expand_braces(random.choice(third_lines))
-
     return "\n".join([line1, line2, line3])
 
 # ========= HELP =========
@@ -756,7 +746,6 @@ def naver_set_bid(new_bid: int):
 
 # ========= NAVER 검색 URL =========
 def _naver_search_url(keyword: str) -> str:
-    # 플레이스 탭 기준
     q = urllib.parse.quote(keyword)
     return f"https://search.naver.com/search.naver?where=place&sm=tab_jum&query={q}"
 
@@ -859,7 +848,7 @@ def naver_schedule_loop(context):
             except:
                 pass
 
-# ========= NAVER 입찰추정 (기존 로직 유지) =========
+# ========= NAVER 입찰추정 루프(기존 로직 유지) =========
 def detect_ad_position(html: str, marker: str):
     if not marker:
         return None
@@ -1008,30 +997,30 @@ def naver_abtest_loop(context):
 
 # ========= NAVER 노출감시 (광고 제외 플레이스) =========
 def is_ad_block(block: str) -> bool:
-    # 명시적인 광고 표기 위주로 판단
     if re.search(r'data-adid=|"ad_flag"|_ad_|"link_ad"', block, re.I):
         return True
     if re.search(r'"chargeInfo"\s*:\s*"AD"', block):
         return True
     if re.search(r'aria-label="광고"', block):
         return True
-    # 단순 '광고' 텍스트는 무시
     return False
 
 def detect_place_rank_no_ads(html: str, marker: str):
     """
-    네이버 플레이스 검색 결과에서
-    광고(AD) 블록을 제외하고 marker 가 들어간 매장의 순위를 계산.
-    - data-cid / place_item / place_bluelink 등을 폭넓게 인식
-    - 공백 제거 후 부분 일치로 비교 (예: '두젠틀 강남' ⊂ '두젠틀 애견카페 강남')
+    네이버 플레이스 검색 결과에서 광고로 추정되는 블록을 제외하고,
+    marker의 단어들이 모두 포함된 매장의 순위를 계산.
+    - data-cid / place_item / place_bluelink 등 폭넓게 블록 추출
+    - 블록 텍스트에서 태그 제거 후 단어 포함 여부로 매칭
     """
     if not marker:
         return None
 
-    marker_norm = re.sub(r"\s+", "", marker.strip())
+    marker = marker.strip()
+    words = [w for w in marker.split() if w]
+
     blocks = []
 
-    # li/div + (place_item or data-cid)
+    # li/div + place_item or data-cid
     pattern = (
         r'(<li[^>]+(?:place_item|data-cid=)[^>]*>.*?</li>)'
         r'|(<div[^>]+(?:place_item|data-cid=)[^>]*>.*?</div>)'
@@ -1040,15 +1029,15 @@ def detect_place_rank_no_ads(html: str, marker: str):
         block = m.group(0)
         blocks.append((m.start(), block))
 
-    # place_bluelink 기준 블록 (fallback)
+    # place_bluelink 기반 fallback
     if not blocks:
         for m in re.finditer(r'class="place_bluelink"', html):
             start = html.rfind("<", 0, m.start())
             end_li = html.find("</li>", m.end())
             end_div = html.find("</div>", m.end())
-            end_candidates = [x for x in [end_li, end_div] if x != -1]
-            if start != -1 and end_candidates:
-                end = min(end_candidates)
+            ends = [x for x in (end_li, end_div) if x != -1]
+            if start != -1 and ends:
+                end = min(ends)
                 block = html[start:end+6]
                 blocks.append((start, block))
 
@@ -1057,25 +1046,29 @@ def detect_place_rank_no_ads(html: str, marker: str):
 
     blocks.sort(key=lambda x: x[0])
 
-    # 광고 제거
-    organic = [(pos, blk) for pos, blk in blocks if not is_ad_block(blk)]
+    organic = []
+    for pos, blk in blocks:
+        if not is_ad_block(blk):
+            organic.append((pos, blk))
+
     if not organic:
         return None
 
-    # 1차: 블록 내부 텍스트에서 marker 부분 일치
+    # 1차: 단어 포함 여부로 매칭
     for idx, (_, blk) in enumerate(organic, start=1):
-        blk_norm = re.sub(r"\s+", "", blk)
-        if marker_norm in blk_norm:
+        text = re.sub(r"<[^>]+>", " ", blk)
+        text = re.sub(r"\s+", " ", text)
+        if all(w in text for w in words):
             return idx
 
-    # 2차: marker 위치 기준으로 앞에 있는 organic 개수
-    raw_pos = html.find(marker.strip())
-    if raw_pos < 0:
+    # 2차: marker 문자열 위치 기준
+    marker_pos = html.find(marker)
+    if marker_pos < 0:
         return None
 
     rank = 0
     for pos, _ in organic:
-        if pos >= raw_pos:
+        if pos >= marker_pos:
             break
         rank += 1
 
@@ -1141,73 +1134,55 @@ def _extract_int_by_key(html: str, key: str):
 
 def get_place_review_count():
     """
-    NAVER_PLACE_ID 기준 리뷰 수를 가져옵니다.
+    NAVER_PLACE_ID 기준 리뷰 수 합산.
 
-    우선순위:
-    1) visitorReviewCount + blogReviewCount
-    2) 각 페이지 totalReviewCount (다른 타입 카운트 없을 때만)
-    3) 메인 페이지 '방문자 리뷰 XXX · 블로그 리뷰 YYY' 텍스트 파싱
+    1) m.place 페이지에서 visitorReviewCount / blogReviewCount 찾기
+    2) 있으면 둘을 합산
+    3) 없으면 totalReviewCount 사용
+    4) 그래도 없으면 '방문자 리뷰 523 · 블로그 리뷰 172' 텍스트 파싱해서 합산
+    5) 마지막으로 일반 '리뷰 N' 패턴 시도
     """
     if not NAVER_PLACE_ID:
         return None
 
-    visitor = None
-    blog = None
-
-    # 방문자 리뷰
-    try:
-        url_v = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}/review/visitor"
-        r_v = requests.get(url_v, headers=NAVER_HEADERS, timeout=5)
-        html_v = r_v.text
-
-        visitor = _extract_int_by_key(html_v, "visitorReviewCount")
-        if visitor is None:
-            total = _extract_int_by_key(html_v, "totalReviewCount")
-            blog_in_same = _extract_int_by_key(html_v, "blogReviewCount")
-            if total is not None and blog_in_same is None:
-                visitor = total
-    except Exception as e:
-        print("[NAVER] 방문자 리뷰 수 조회 실패:", e)
-
-    # 블로그 리뷰
-    try:
-        url_b = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}/review/blog"
-        r_b = requests.get(url_b, headers=NAVER_HEADERS, timeout=5)
-        html_b = r_b.text
-
-        blog = _extract_int_by_key(html_b, "blogReviewCount")
-        if blog is None:
-            total_b = _extract_int_by_key(html_b, "totalReviewCount")
-            visitor_in_same = _extract_int_by_key(html_b, "visitorReviewCount")
-            if total_b is not None and visitor_in_same is None:
-                blog = total_b
-    except Exception as e:
-        print("[NAVER] 블로그 리뷰 수 조회 실패:", e)
-
-    if visitor is not None and blog is not None:
-        return visitor + blog
-    if visitor is not None:
-        return visitor
-    if blog is not None:
-        return blog
-
-    # 최종 fallback: 메인 페이지에서 텍스트 파싱
     try:
         url = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}"
         r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
         html = r.text
-
-        m_v = re.search(r"방문자 리뷰\s*([0-9,]+)", html)
-        m_b = re.search(r"블로그 리뷰\s*([0-9,]+)", html)
-
-        v = int(m_v.group(1).replace(",", "")) if m_v else 0
-        b = int(m_b.group(1).replace(",", "")) if m_b else 0
-
-        if v or b:
-            return v + b
     except Exception as e:
-        print("[NAVER] 리뷰 수 텍스트 파싱 실패:", e)
+        print("[NAVER] 리뷰 수 조회 실패(요청):", e)
+        return None
 
+    v = _extract_int_by_key(html, "visitorReviewCount")
+    b = _extract_int_by_key(html, "blogReviewCount")
+
+    if v is not None or b is not None:
+        v = v or 0
+        b = b or 0
+        return v + b if (v or b) else None
+
+    total = _extract_int_by_key(html, "totalReviewCount")
+    if total is not None:
+        return total
+
+    # '방문자 리뷰 523 · 블로그 리뷰 172'
+    m_v = re.search(r"방문자\s*리뷰[^0-9]*([0-9,]+)", html)
+    m_b = re.search(r"블로그\s*리뷰[^0-9]*([0-9,]+)", html)
+    if m_v or m_b:
+        vv = int(m_v.group(1).replace(",", "")) if m_v else 0
+        bb = int(m_b.group(1).replace(",", "")) if m_b else 0
+        if vv or bb:
+            return vv + bb
+
+    # 일반 '리뷰 695' 같은 패턴
+    m = re.search(r"리뷰[^0-9]{0,10}([0-9,]+)", html)
+    if m:
+        try:
+            return int(m.group(1).replace(",", ""))
+        except:
+            pass
+
+    print("[NAVER] 리뷰 수 파싱 실패")
     return None
 
 def naver_review_watch_loop(context):
