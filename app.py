@@ -26,7 +26,7 @@ NAVER_CAMPAIGN_ID   = os.getenv("NAVER_CAMPAIGN_ID", "").strip()
 NAVER_ADGROUP_ID    = os.getenv("NAVER_ADGROUP_ID", "").strip()
 NAVER_ADGROUP_NAME  = os.getenv("NAVER_ADGROUP_NAME", "").strip()
 
-# Naver Place (리뷰 감시용)
+# Naver Place (리뷰/노출 감시용)
 NAVER_PLACE_ID      = os.getenv("NAVER_PLACE_ID", "").strip()
 
 DATA_FILE = os.path.join(DATA_DIR, "portfolio.json")
@@ -412,6 +412,41 @@ REVIEWS = [
         "하루에도 몇 번씩 사진과 영상 보내주셔서 걱정이 싹 사라졌어요.",
         "사장님이 너무 친절해서 믿음이 가는 곳이에요."
     ],
+    [
+        "{휴가기간|일주일|며칠|연휴} 동안 맡겼는데 대만족이에요!",
+        "시설도 깨끗하고 아이가 즐겁게 노는 모습이 영상으로 와서 행복했어요.",
+        "두젠틀은 진짜 믿고 맡길 수 있는 곳이에요."
+    ],
+    [
+        "{한 달|휴가기간|며칠|일주일} 동안 맡겼는데 너무 만족스러웠어요.",
+        "영상으로 아이가 노는 모습 보내주셔서 매일 안심됐어요.",
+        "시설도 깔끔하고 사장님도 세심하게 케어해주셨어요."
+    ],
+    [
+        "{며칠|휴가기간|연휴|주말} 동안 이용했는데 최고였어요.",
+        "사진이랑 영상으로 아이 근황 알려주셔서 든든했어요.",
+        "시설도 깨끗하고 아이가 밝아져서 너무 만족입니다."
+    ],
+    [
+        "{휴가기간|일주일|3일|며칠} 동안 맡겼는데 정말 마음에 들었어요.",
+        "영상으로 아이 상태를 바로 확인할 수 있어서 걱정이 줄었어요.",
+        "사장님이 세심하게 챙겨주셔서 믿고 맡길 수 있었습니다."
+    ],
+    [
+        "{한 달|휴가기간|며칠|연휴} 동안 맡겼는데 너무 좋았어요.",
+        "사진, 영상으로 아이 소식을 자주 받아서 마음이 편했어요.",
+        "시설도 깨끗하고 케어가 꼼꼼해서 정말 만족했어요."
+    ],
+    [
+        "{일주일|휴가기간|며칠|연휴} 동안 맡겼는데 완전 만족이에요.",
+        "아이 영상을 수시로 보내주셔서 매일 안심됐어요.",
+        "시설도 좋고 분위기도 밝아서 또 맡길 예정이에요."
+    ],
+    [
+        "{한 달|휴가기간|며칠|주말} 동안 맡겼는데 진짜 최고였어요.",
+        "하루에도 여러 번 사진, 영상 보내주셔서 믿음이 갔어요.",
+        "아이도 행복해 보여서 또 이용하려구요."
+    ],
 ]
 
 def _expand_braces(text: str) -> str:
@@ -421,10 +456,9 @@ def _expand_braces(text: str) -> str:
     return re.sub(r"{([^}]+)}", repl, text)
 
 def build_random_hotel_review() -> str:
-    line1 = _expand_braces(random.choice(REVIEWS)[0])
-    line2 = _expand_braces(random.choice(REVIEWS)[1])
-    line3 = _expand_braces(random.choice(REVIEWS)[2])
-    return "\n".join([line1, line2, line3])
+    # 한 세트(3줄)를 고르고, 각 줄 안에서만 {} 랜덤 치환
+    lines = random.choice(REVIEWS)
+    return "\n".join(_expand_braces(line) for line in lines)
 
 # ========= HELP =========
 HELP = (
@@ -450,7 +484,6 @@ HELP = (
 )
 
 # ========= PENDING =========
-# 여러 단계 입력(키워드 -> 마커 -> 간격 등)을 기억하는 용도
 def set_pending(cid, action, step="symbol", data=None):
     p = state["pending"].setdefault(str(cid), {})
     p.update({"action": action, "step": step, "data": data or {}})
@@ -705,6 +738,12 @@ def naver_set_bid(new_bid: int):
     else:
         return False, "API 응답이 예상과 다릅니다."
 
+# ========= NAVER 검색 URL 헬퍼 =========
+def _naver_search_url(keyword: str) -> str:
+    # 플레이스 검색 탭 기준 URL (실제 플레이스 노출과 최대한 일치하도록)
+    q = urllib.parse.quote(keyword)
+    return f"https://search.naver.com/search.naver?where=place&sm=tab_jum&query={q}"
+
 # ========= NAVER STATUS / SCHEDULE =========
 def send_naver_status(update):
     nav = state.setdefault("naver", {})
@@ -895,11 +934,7 @@ def naver_abtest_loop(context):
 
         html = ""
         try:
-            url = (
-                "https://search.naver.com/search.naver"
-                "?where=nexearch&sm=tab_hty.top&query="
-                + urllib.parse.quote(keyword)
-            )
+            url = _naver_search_url(keyword)
             r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
             html = r.text
         except Exception as e:
@@ -964,42 +999,43 @@ def is_ad_block(block: str) -> bool:
         return True
     if re.search(r'aria-label="광고"', block):
         return True
-    # 위 조건 외의 일반 "광고" 단어는 무시 (태그라인 등에 있을 수 있음)
+    # 단순 '광고' 단어는 태그라인 등에 있을 수 있으므로 무시
     return False
 
 def detect_place_rank_no_ads(html: str, marker: str):
     """
-    플레이스 리스트에서 광고로 보이는 블록을 제외하고,
+    플레이스 리스트에서 광고 블록을 제외하고,
     marker 문자열이 들어간 항목의 순위를 계산.
+    li/div + data-cid 기반으로 동작.
     """
     if not marker:
         return None
     marker = marker.strip()
 
-    # 1) data-cid 있는 li만 대상으로 사용
-    lis = list(re.finditer(r'<li[^>]+data-cid="[^"]+"[^>]*>.*?</li>', html, re.S))
-    if not lis:
+    # data-cid 를 가진 li/div 블록 전체 수집
+    pattern = r'<(li|div)[^>]+data-cid="[^"]+"[^>]*>.*?</\1>'
+    blocks = list(re.finditer(pattern, html, re.S))
+    if not blocks:
         return None
 
-    # 2) 광고 아닌 블록만 모음
     organic_blocks = []
-    for m in lis:
+    for m in blocks:
         block = m.group(0)
         if not is_ad_block(block):
             organic_blocks.append(block)
 
-    # 3) 유기(organic) 블록에서 marker 검색
+    # 1차: 유기 블록 내부에서 marker 포함 여부
     for idx, block in enumerate(organic_blocks, start=1):
         if marker in block:
             return idx
 
-    # 4) 폴백: marker 위치 기준 앞쪽 organic li 개수 세기
+    # 2차: marker 위치를 기준으로 앞의 유기 블록 수 세기 (폴백)
     pos = html.find(marker)
     if pos < 0:
         return None
 
     rank = 0
-    for m in lis:
+    for m in blocks:
         if m.start() >= pos:
             break
         block = m.group(0)
@@ -1027,11 +1063,7 @@ def naver_rank_watch_loop(context):
 
     html = ""
     try:
-        url = (
-            "https://search.naver.com/search.naver"
-            "?where=nexearch&sm=tab_hty.top&query="
-            + urllib.parse.quote(keyword)
-        )
+        url = _naver_search_url(keyword)
         r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
         html = r.text
     except Exception as e:
@@ -1066,28 +1098,68 @@ def naver_rank_watch_loop(context):
     save_state()
 
 # ========= NAVER 리뷰감시 =========
+def _extract_count(html: str, keys):
+    for key in keys:
+        m = re.search(rf'"{key}"\s*:\s*(\d+)', html)
+        if m:
+            return int(m.group(1))
+    return None
+
 def get_place_review_count():
+    """
+    방문자 리뷰 + 블로그 리뷰 합산.
+    (예: 방문자 523 + 블로그 172 = 695 형태)
+    """
     if not NAVER_PLACE_ID:
         return None
+
+    total = 0
+
+    # 방문자 리뷰
+    try:
+        url_v = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}/review/visitor"
+        r_v = requests.get(url_v, headers=NAVER_HEADERS, timeout=5)
+        html_v = r_v.text
+
+        cnt_v = _extract_count(html_v, [
+            "visitorReviewCount",  # 우선 방문자 리뷰 전용
+            "totalReviewCount",    # 구조에 따라 방문자 기준일 수 있음
+            "reviewCount",
+        ])
+        if cnt_v:
+            total += cnt_v
+    except Exception as e:
+        print("[NAVER] 방문자 리뷰 수 조회 실패:", e)
+
+    # 블로그 리뷰
+    try:
+        url_b = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}/review/blog"
+        r_b = requests.get(url_b, headers=NAVER_HEADERS, timeout=5)
+        html_b = r_b.text
+
+        cnt_b = _extract_count(html_b, [
+            "blogReviewCount",
+            "totalReviewCount",
+            "reviewCount",
+        ])
+        if cnt_b:
+            total += cnt_b
+    except Exception as e:
+        print("[NAVER] 블로그 리뷰 수 조회 실패:", e)
+
+    if total > 0:
+        return total
+
+    # 폴백: 이전 방식 (필요시)
     try:
         url = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}/review/visitor"
         r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
         html = r.text
-
-        m = re.search(r'"totalReviewCount"\s*:\s*(\d+)', html)
-        if m:
-            return int(m.group(1))
-
-        m = re.search(r'"reviewCount"\s*:\s*(\d+)', html)
-        if m:
-            return int(m.group(1))
-
         m = re.search(r'리뷰[^0-9]{0,10}([0-9,]+)', html)
         if m:
             return int(m.group(1).replace(",", ""))
-
     except Exception as e:
-        print("[NAVER] 리뷰 수 조회 실패:", e)
+        print("[NAVER] 리뷰 수 폴백 조회 실패:", e)
 
     return None
 
@@ -1157,11 +1229,7 @@ def naver_rank_check_once(update):
         return
 
     try:
-        url = (
-            "https://search.naver.com/search.naver"
-            "?where=nexearch&sm=tab_hty.top&query="
-            + urllib.parse.quote(keyword)
-        )
+        url = _naver_search_url(keyword)
         r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
         html = r.text
         pos = detect_place_rank_no_ads(html, marker)
