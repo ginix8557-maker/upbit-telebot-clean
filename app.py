@@ -441,9 +441,9 @@ HELP = (
     "• 광고시간 : 'HH:MM/입찰가' 형식으로 시간표 설정\n"
     "• 광고자동 : 시간표 자동 적용 켜기/끄기\n"
     "• 입찰추정 : 1순위 추정 입찰가 자동 탐색\n"
-    "• 노출감시 : 플레이스 순위 변동 실시간 감시 ON/OFF\n"
+    "• 노출감시 : 플레이스 순위 변동 실시간 감시 ON/OFF (광고 제외)\n"
     "• 리뷰감시 : NAVER_PLACE_ID 기준 신규 리뷰 실시간 감시 ON/OFF\n"
-    "• 노출현황 : 현재 플레이스 순위를 즉시 1회 조회\n"
+    "• 노출현황 : 현재 플레이스 순위를 즉시 1회 조회 (광고 제외)\n"
     "• 리뷰현황 : 현재 리뷰 개수를 즉시 1회 조회\n"
     "\n"
     "🏨 호텔 : 랜덤 후기 3줄 생성\n"
@@ -754,7 +754,7 @@ def send_naver_status(update):
     if rw.get("enabled"):
         lines.append(
             f"- 노출감시: ON (키워드 '{rw.get('keyword','')}', "
-            f"간격 {rw.get('interval',300)}초, 최근 순위 {rw.get('last_rank')})"
+            f"간격 {rw.get('interval',300)}초, 최근 순위 {rw.get('last_rank')}위, 광고 제외)"
         )
     else:
         lines.append("- 노출감시: OFF")
@@ -956,48 +956,50 @@ def naver_abtest_loop(context):
         except:
             pass
 
-# ========= NAVER 노출감시 =========
+# ========= NAVER 노출감시 (광고 제외 플레이스) =========
 def detect_place_rank_no_ads(html: str, marker: str):
     """
-    네이버 검색 결과 HTML에서 광고(추정) 블록을 최대한 제외하고,
-    marker(매장명/식별문구)가 포함된 플레이스 항목의 순위를 계산합니다.
-    구조가 달라져도 동작하도록 완화된 로직 + 폴백 포함.
+    플레이스 리스트에서 '광고'로 표기된 항목 및 광고 관련 속성이 있는 li를 전부 제외하고,
+    marker(매장명/식별문구)가 들어간 항목의 순위를 계산합니다.
     """
     if not marker:
         return None
     marker = marker.strip()
 
-    # 1) data-cid 기반 플레이스 li 블록 추출
+    def is_ad_block(block: str) -> bool:
+        # 태그 기반
+        if re.search(r'data-ad-?|adid=|ad_flag|_ad_|"link_ad"', block, re.I):
+            return True
+        # 텍스트에서 '광고' 라벨
+        text = re.sub(r'<[^>]+>', ' ', block)
+        if re.search(r'\b광고\b', text):
+            return True
+        return False
+
+    # 1) data-cid li 블록을 모아서 광고 아닌 것만 남김
     blocks = []
     for m in re.finditer(r'<li[^>]+data-cid="[^"]+"[^>]*>.*?</li>', html, re.S):
         block = m.group(0)
-
-        # 광고로 추정되는 블록: ad 관련 키워드가 있고, marker 는 없는 경우만 제외
-        if re.search(r'adid=|ad_flag|_ad_|"link_ad"|data-ad-?', block, re.I) and (marker not in block):
+        if is_ad_block(block):
             continue
-
         blocks.append(block)
 
-    # 2) 추출된 블록에서 marker 검색
+    # 2) 남은 블록에서 marker 찾기
     if blocks:
-        rank = 1
-        for block in blocks:
+        for idx, block in enumerate(blocks, start=1):
             if marker in block:
-                return rank
-            rank += 1
+                return idx
 
-    # 3) 폴백:
-    # marker 위치 기준으로 앞에 등장한 place-li 개수를 세어 순위 추정
+    # 3) 폴백: marker 위치 앞의 비광고 li 개수로 순위 추정
     pos = html.find(marker)
     if pos < 0:
         return None
 
-    rank = 1
-    for m in re.finditer(r'<li[^>]+data-cid="[^"]+"', html):
-        if m.start() < pos:
+    rank = 0
+    for m in re.finditer(r'<li[^>]+data-cid="[^"]+"[^>]*>.*?</li>', html[:pos], re.S):
+        block = m.group(0)
+        if not is_ad_block(block):
             rank += 1
-        else:
-            break
 
     return rank if rank > 0 else None
 
@@ -1040,7 +1042,7 @@ def naver_rank_watch_loop(context):
             try:
                 send_ctx(
                     context,
-                    f"📡 [노출감시 시작]\n키워드 '{keyword}' 현재 순위: {pos}위"
+                    f"📡 [노출감시 시작]\n키워드 '{keyword}' 현재 순위: {pos}위 (광고 제외)"
                 )
             except:
                 pass
@@ -1048,7 +1050,7 @@ def naver_rank_watch_loop(context):
             try:
                 send_ctx(
                     context,
-                    f"📡 [노출감시] 순위 변경\n키워드 '{keyword}': {prev}위 → {pos}위"
+                    f"📡 [노출감시] 순위 변경\n키워드 '{keyword}': {prev}위 → {pos}위 (광고 제외)"
                 )
             except:
                 pass
@@ -1064,7 +1066,7 @@ def get_place_review_count():
         return None
     try:
         url = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}/review/visitor"
-        r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
+        r = requests.get(url, headers[NAVER_HEADERS], timeout=5)
         html = r.text
 
         m = re.search(r'"totalReviewCount"\s*:\s*(\d+)', html)
@@ -1173,7 +1175,7 @@ def naver_rank_check_once(update):
         save_state()
         reply(
             update,
-            f"노출현황: 키워드 '{keyword}' 기준 현재 순위는 {pos}위입니다."
+            f"노출현황: 키워드 '{keyword}' 기준 현재 순위는 {pos}위입니다. (광고 제외)"
         )
 
 def naver_review_check_once(update):
@@ -1805,7 +1807,7 @@ def main():
                     "봇이 시작되었습니다. '메뉴' 키로 모드를 선택하세요.\n"
                     "- 코인: 보기/상태/코인/지정가\n"
                     "- 네이버 광고: 광고상태/광고설정/광고시간/광고자동/"
-                    "입찰추정/노출감시/리뷰감시/노출현황/리뷰현황"
+                    "입찰추정/노출감시/리뷰감시/노출현황/리뷰현황 (광고 제외 순위)"
                 )
         except:
             pass
