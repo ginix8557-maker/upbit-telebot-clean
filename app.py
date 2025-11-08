@@ -13,8 +13,7 @@ CHAT_ID     = str(os.getenv("CHAT_ID", "")).strip()
 DEFAULT_THRESHOLD = float(os.getenv("THRESHOLD_PCT", "1.0"))
 PORT        = int(os.getenv("PORT", "0"))
 
-# DATA_DIR: Render Persistent Disk 등 외부 저장소 사용
-# 환경변수 DATA_DIR이 있으면 그 경로 사용, 없으면 현재 디렉토리(".")
+# Persistent state dir (Render Disk 등)
 DATA_DIR    = os.getenv("DATA_DIR", "").strip() or "."
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -34,6 +33,15 @@ DATA_FILE = os.path.join(DATA_DIR, "portfolio.json")
 LOCK_FILE = os.path.join(DATA_DIR, "bot.lock")
 UPBIT     = "https://api.upbit.com/v1"
 
+# Naver 공통 헤더
+NAVER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    ),
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
 # ========= KEEPALIVE HTTP =========
 class _Ok(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -51,12 +59,14 @@ class _Ok(BaseHTTPRequestHandler):
 def _start_keepalive():
     if PORT <= 0:
         return
+
     def _run():
         try:
             httpd = HTTPServer(("", PORT), _Ok)
             httpd.serve_forever()
         except:
             pass
+
     threading.Thread(target=_run, daemon=True).start()
 
 # ========= SINGLE INSTANCE LOCK =========
@@ -121,7 +131,7 @@ def _default_state():
             },
             "review_watch": {
                 "enabled": False,
-                "interval": 180,     # 초 단위 (기본 3분)
+                "interval": 180,
                 "last_count": None,
                 "last_check": 0.0,
             },
@@ -141,6 +151,7 @@ def load_state():
     d.setdefault("coins", {})
     d.setdefault("default_threshold_pct", DEFAULT_THRESHOLD)
     d.setdefault("pending", {})
+
     nav = d.setdefault("naver", {})
     nav.setdefault("auto_enabled", False)
     nav.setdefault("schedules", [])
@@ -197,9 +208,7 @@ def save_state():
 
 state = load_state()
 
-# ⚠️ 중요: .env 값으로 기존 설정을 덮어쓰지 않도록 수정
-# 처음 실행(파일에 값이 전혀 없을 때)만 DEFAULT_THRESHOLD를 세팅하고,
-# 이후에는 텔레그램에서 변경한 값을 그대로 유지합니다.
+# 이미 저장된 값이 있으면 유지, 없으면 DEFAULT_THRESHOLD로 초기화
 if "default_threshold_pct" not in state:
     state["default_threshold_pct"] = float(DEFAULT_THRESHOLD)
     save_state()
@@ -701,15 +710,6 @@ def naver_set_bid(new_bid: int):
 
 # ========= NAVER STATUS / SCHEDULE =========
 def send_naver_status(update):
-    if not naver_enabled():
-        reply(
-            update,
-            "네이버 광고 API 정보가 설정되지 않았습니다.\n"
-            ".env에 NAVER_API_KEY / NAVER_API_SECRET / NAVER_CUSTOMER_ID / "
-            "NAVER_CAMPAIGN_ID / NAVER_ADGROUP_ID / NAVER_ADGROUP_NAME 을 확인하세요."
-        )
-        return
-
     nav = state.setdefault("naver", {})
     auto = "켜짐" if nav.get("auto_enabled") else "꺼짐"
     schedules = nav.get("schedules") or []
@@ -725,7 +725,12 @@ def send_naver_status(update):
     else:
         lines.append("- 시간표: 없음 (광고시간 명령으로 설정)")
 
-    current = naver_get_bid()
+    current = None
+    try:
+        if naver_enabled():
+            current = naver_get_bid()
+    except:
+        pass
     if current is not None:
         try:
             current_int = int(current)
@@ -733,7 +738,10 @@ def send_naver_status(update):
             current_int = current
         lines.append(f"- 현재 입찰가: {current_int}원")
     else:
-        lines.append("- 현재 입찰가: 조회 실패")
+        if naver_enabled():
+            lines.append("- 현재 입찰가: 조회 실패")
+        else:
+            lines.append("- 현재 입찰가: Searchad API 미설정")
 
     last = nav.get("last_applied") or "없음"
     lines.append(f"- 마지막 자동 적용: {last}")
@@ -748,7 +756,7 @@ def send_naver_status(update):
     if rw.get("enabled"):
         lines.append(
             f"- 노출감시: ON (키워드 '{rw.get('keyword','')}', "
-            f"간격 {rw.get('interval',300)}초, 최근 순위 {rw.get('last_rank')}위, 광고 제외)"
+            f"간격 {rw.get('interval',300)}초, 최근 순위 {rw.get('last_rank')})"
         )
     else:
         lines.append("- 노출감시: OFF")
@@ -895,11 +903,7 @@ def naver_abtest_loop(context):
                 "?where=nexearch&sm=tab_hty.top&query="
                 + urllib.parse.quote(keyword)
             )
-            r = requests.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=5,
-            )
+            r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
             html = r.text
         except Exception as e:
             print("[NAVER] 검색 결과 조회 실패:", e)
@@ -954,26 +958,29 @@ def naver_abtest_loop(context):
         except:
             pass
 
-# ========= NAVER 노출감시 (광고 제외 플레이스) =========
+# ========= NAVER 노출감시 =========
 def detect_place_rank_no_ads(html: str, marker: str):
     if not marker:
         return None
 
     blocks = []
-    for m in re.finditer(r'<li[^>]+data-cid="[^"]+"[^>]*>.*?</li>', html, re.S):
-        block = m.group(0)
-        # 광고로 추정되는 블록 제외
-        if re.search(r'data-adid=|"ad_flag"|_ad_|"link_ad"', block):
-            continue
-        if ("광고" in block) and (marker not in block):
-            continue
+    for m in re.finditer(r'data-cid="[^"]+"', html):
+        start = max(0, m.start() - 800)
+        end = m.end() + 800
+        block = html[start:end]
         blocks.append(block)
 
     if not blocks:
         return None
 
-    rank = 1
+    filtered = []
     for block in blocks:
+        if (("광고" in block) or ("AD" in block)) and (marker not in block):
+            continue
+        filtered.append(block)
+
+    rank = 1
+    for block in filtered:
         if marker in block:
             return rank
         rank += 1
@@ -986,8 +993,8 @@ def naver_rank_watch_loop(context):
     if not cfg.get("enabled"):
         return
 
-    keyword = cfg.get("keyword") or ""
-    marker = cfg.get("marker") or ""
+    keyword = (cfg.get("keyword") or "").strip()
+    marker = (cfg.get("marker") or "").strip()
     interval = int(cfg.get("interval", 300))
     last_check = float(cfg.get("last_check", 0.0))
     now = time.time()
@@ -1004,11 +1011,7 @@ def naver_rank_watch_loop(context):
             "?where=nexearch&sm=tab_hty.top&query="
             + urllib.parse.quote(keyword)
         )
-        r = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=5,
-        )
+        r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
         html = r.text
     except Exception as e:
         print("[NAVER] 노출감시 조회 실패:", e)
@@ -1017,41 +1020,54 @@ def naver_rank_watch_loop(context):
     prev = cfg.get("last_rank", None)
 
     cfg["last_check"] = now
+
     if pos is not None:
-        if prev is not None and pos != prev:
+        if prev is None:
             try:
                 send_ctx(
                     context,
-                    f"📡 [노출감시] (광고 제외)\n키워드 '{keyword}' 순위 변경: {prev}위 → {pos}위"
+                    f"📡 [노출감시 시작]\n키워드 '{keyword}' 현재 순위: {pos}위"
+                )
+            except:
+                pass
+        elif pos != prev:
+            try:
+                send_ctx(
+                    context,
+                    f"📡 [노출감시] 순위 변경\n키워드 '{keyword}': {prev}위 → {pos}위"
                 )
             except:
                 pass
         cfg["last_rank"] = pos
+    else:
+        print("[NAVER] 노출감시: marker 결과 없음")
+
     save_state()
 
-# ========= NAVER 리뷰감시 (간격 설정 지원) =========
+# ========= NAVER 리뷰감시 =========
 def get_place_review_count():
     if not NAVER_PLACE_ID:
         return None
     try:
-        url = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}/review/visitor"
-        r = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=5,
-        )
+        url = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}"
+        r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
         html = r.text
+
         m = re.search(r'"totalReviewCount"\s*:\s*(\d+)', html)
         if m:
             return int(m.group(1))
-        m2 = re.search(r'"reviewCount"\s*:\s*(\d+)', html)
-        if m2:
-            return int(m2.group(1))
-        m3 = re.search(r'리뷰\s*([0-9,]+)', html)
-        if m3:
-            return int(m3.group(1).replace(",", ""))
+
+        m = re.search(r'"reviewCount"\s*:\s*(\d+)', html)
+        if m:
+            return int(m.group(1))
+
+        m = re.search(r'리뷰[^0-9]{0,10}([0-9,]+)', html)
+        if m:
+            return int(m.group(1).replace(",", ""))
+
     except Exception as e:
         print("[NAVER] 리뷰 수 조회 실패:", e)
+
     return None
 
 def naver_review_watch_loop(context):
@@ -1073,6 +1089,7 @@ def naver_review_watch_loop(context):
     cfg["last_check"] = now
 
     if cnt is None:
+        print("[NAVER] 리뷰감시: 리뷰 수 없음/파싱 실패")
         save_state()
         return
 
@@ -1080,6 +1097,13 @@ def naver_review_watch_loop(context):
     if last is None:
         cfg["last_count"] = cnt
         save_state()
+        try:
+            send_ctx(
+                context,
+                f"⭐️ [리뷰감시 시작] 현재 리뷰 {cnt}건 기준으로 감시합니다."
+            )
+        except:
+            pass
         return
 
     if cnt > last:
@@ -1089,7 +1113,7 @@ def naver_review_watch_loop(context):
         try:
             send_ctx(
                 context,
-                f"⭐️ [리뷰감시] 네이버 플레이스 신규 리뷰 {diff}건 추가 (총 {cnt}건)"
+                f"⭐️ [리뷰감시] 신규 리뷰 {diff}건 추가 (총 {cnt}건)"
             )
         except:
             pass
@@ -1193,7 +1217,7 @@ def on_text(update, context):
             clear_pending(cid)
             return
 
-        # --- 지정가(트리거) 플로우 (코인) ---
+        # --- 지정가(트리거) 플로우 ---
         if action == "trigger":
             if step == "symbol":
                 data["symbol"] = text.upper()
@@ -1433,6 +1457,9 @@ def on_text(update, context):
                 clear_pending(cid)
                 reply(update, f"노출감시를 시작합니다. (간격 {sec}초, 광고 제외 순위 기준)")
                 return
+
+        # --- 네이버 리뷰감시 플로우 ---
+        # (별도 다단계 입력은 없고, 명령에서 바로 처리하므로 여기서는 없음)
 
     # ===== 기본 명령 처리 =====
     head = text.split()[0].lstrip("/")
@@ -1690,7 +1717,7 @@ def main():
     up.job_queue.run_repeating(naver_abtest_loop, interval=15, first=15)
     # 노출감시 루프
     up.job_queue.run_repeating(naver_rank_watch_loop, interval=30, first=20)
-    # 리뷰감시 루프 (실제 주기는 내부 interval로 제어)
+    # 리뷰감시 루프
     up.job_queue.run_repeating(naver_review_watch_loop, interval=30, first=40)
 
     def hi(ctx):
