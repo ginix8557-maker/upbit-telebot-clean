@@ -33,7 +33,6 @@ DATA_FILE = os.path.join(DATA_DIR, "portfolio.json")
 LOCK_FILE = os.path.join(DATA_DIR, "bot.lock")
 UPBIT     = "https://api.upbit.com/v1"
 
-# 네이버용 공통 헤더
 NAVER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -436,22 +435,22 @@ HELP = (
     "• 보기 / 상태 / 코인 / 가격 / 평단 / 수량 / 임계값 / 지정가\n"
     "\n"
     "📢 네이버 광고 기능\n"
-    "• 광고상태 : 현재 입찰/설정/감시 상태 요약\n"
-    "• 광고설정 X : 입찰가를 X원으로 즉시 변경 (예: '광고설정 300')\n"
-    "• 광고시간 : 'HH:MM/입찰가' 형식으로 시간표 설정\n"
+    "• 광고상태 : 현재 설정/감시 요약\n"
+    "• 광고설정 X : 입찰가를 X원으로 즉시 변경\n"
+    "• 광고시간 : 'HH:MM/입찰가' 형식 시간표 설정\n"
     "• 광고자동 : 시간표 자동 적용 켜기/끄기\n"
     "• 입찰추정 : 1순위 추정 입찰가 자동 탐색\n"
-    "• 노출감시 : 플레이스 순위 변동 실시간 감시 ON/OFF (광고 제외)\n"
-    "• 리뷰감시 : NAVER_PLACE_ID 기준 신규 리뷰 실시간 감시 ON/OFF\n"
+    "• 노출감시 : 플레이스 순위 변동 실시간 감시 (광고 제외)\n"
     "• 노출현황 : 현재 플레이스 순위를 즉시 1회 조회 (광고 제외)\n"
+    "• 리뷰감시 : NAVER_PLACE_ID 기준 신규 리뷰 감시\n"
     "• 리뷰현황 : 현재 리뷰 개수를 즉시 1회 조회\n"
     "\n"
     "🏨 호텔 : 랜덤 후기 3줄 생성\n"
-    "\n"
     "🔧 메뉴 : '네이버 광고 / 코인 가격알림' 모드 전환"
 )
 
 # ========= PENDING =========
+# 여러 단계 입력(키워드 -> 마커 -> 간격 등)을 기억하는 용도
 def set_pending(cid, action, step="symbol", data=None):
     p = state["pending"].setdefault(str(cid), {})
     p.update({"action": action, "step": step, "data": data or {}})
@@ -957,46 +956,52 @@ def naver_abtest_loop(context):
             pass
 
 # ========= NAVER 노출감시 (광고 제외 플레이스) =========
+def is_ad_block(block: str) -> bool:
+    # 명시적인 광고 표기 위주로 판단
+    if re.search(r'data-adid=|"ad_flag"|_ad_|"link_ad"', block, re.I):
+        return True
+    if re.search(r'"chargeInfo"\s*:\s*"AD"', block):
+        return True
+    if re.search(r'aria-label="광고"', block):
+        return True
+    # 위 조건 외의 일반 "광고" 단어는 무시 (태그라인 등에 있을 수 있음)
+    return False
+
 def detect_place_rank_no_ads(html: str, marker: str):
     """
-    플레이스 리스트에서 '광고'로 표기된 항목 및 광고 관련 속성이 있는 li를 전부 제외하고,
-    marker(매장명/식별문구)가 들어간 항목의 순위를 계산합니다.
+    플레이스 리스트에서 광고로 보이는 블록을 제외하고,
+    marker 문자열이 들어간 항목의 순위를 계산.
     """
     if not marker:
         return None
     marker = marker.strip()
 
-    def is_ad_block(block: str) -> bool:
-        # 태그 기반
-        if re.search(r'data-ad-?|adid=|ad_flag|_ad_|"link_ad"', block, re.I):
-            return True
-        # 텍스트에서 '광고' 라벨
-        text = re.sub(r'<[^>]+>', ' ', block)
-        if re.search(r'\b광고\b', text):
-            return True
-        return False
+    # 1) data-cid 있는 li만 대상으로 사용
+    lis = list(re.finditer(r'<li[^>]+data-cid="[^"]+"[^>]*>.*?</li>', html, re.S))
+    if not lis:
+        return None
 
-    # 1) data-cid li 블록을 모아서 광고 아닌 것만 남김
-    blocks = []
-    for m in re.finditer(r'<li[^>]+data-cid="[^"]+"[^>]*>.*?</li>', html, re.S):
+    # 2) 광고 아닌 블록만 모음
+    organic_blocks = []
+    for m in lis:
         block = m.group(0)
-        if is_ad_block(block):
-            continue
-        blocks.append(block)
+        if not is_ad_block(block):
+            organic_blocks.append(block)
 
-    # 2) 남은 블록에서 marker 찾기
-    if blocks:
-        for idx, block in enumerate(blocks, start=1):
-            if marker in block:
-                return idx
+    # 3) 유기(organic) 블록에서 marker 검색
+    for idx, block in enumerate(organic_blocks, start=1):
+        if marker in block:
+            return idx
 
-    # 3) 폴백: marker 위치 앞의 비광고 li 개수로 순위 추정
+    # 4) 폴백: marker 위치 기준 앞쪽 organic li 개수 세기
     pos = html.find(marker)
     if pos < 0:
         return None
 
     rank = 0
-    for m in re.finditer(r'<li[^>]+data-cid="[^"]+"[^>]*>.*?</li>', html[:pos], re.S):
+    for m in lis:
+        if m.start() >= pos:
+            break
         block = m.group(0)
         if not is_ad_block(block):
             rank += 1
@@ -1066,7 +1071,7 @@ def get_place_review_count():
         return None
     try:
         url = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}/review/visitor"
-        r = requests.get(url, headers[NAVER_HEADERS], timeout=5)
+        r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
         html = r.text
 
         m = re.search(r'"totalReviewCount"\s*:\s*(\d+)', html)
@@ -1454,7 +1459,7 @@ def on_text(update, context):
                     return
                 data["start_bid"] = start_bid
                 set_pending(cid, "naver_abtest", "marker", data)
-                reply(update, "검색 결과에서 내 광고/매장을 식별할 문구를 입력하세요.\n예: '두젠틀 애견카페 강남'", kb=CANCEL_KB)
+                reply(update, "검색 결과에서 내 매장을 식별할 문구를 입력하세요.\n예: '두젠틀 애견카페 강남'", kb=CANCEL_KB)
                 return
 
             if step == "marker":
@@ -1806,8 +1811,8 @@ def main():
                     ctx,
                     "봇이 시작되었습니다. '메뉴' 키로 모드를 선택하세요.\n"
                     "- 코인: 보기/상태/코인/지정가\n"
-                    "- 네이버 광고: 광고상태/광고설정/광고시간/광고자동/"
-                    "입찰추정/노출감시/리뷰감시/노출현황/리뷰현황 (광고 제외 순위)"
+                    "- 네이버: 광고상태/광고설정/광고시간/광고자동/입찰추정/"
+                    "노출감시/리뷰감시/노출현황/리뷰현황 (광고 제외 순위 기준)"
                 )
         except:
             pass
