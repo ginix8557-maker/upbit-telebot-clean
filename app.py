@@ -13,7 +13,7 @@ CHAT_ID     = str(os.getenv("CHAT_ID", "")).strip()
 DEFAULT_THRESHOLD = float(os.getenv("THRESHOLD_PCT", "1.0"))
 PORT        = int(os.getenv("PORT", "0"))
 
-# Persistent state dir (Render Disk 등)
+# Persistent state dir
 DATA_DIR    = os.getenv("DATA_DIR", "").strip() or "."
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -208,7 +208,6 @@ def save_state():
 
 state = load_state()
 
-# 이미 저장된 값이 있으면 유지, 없으면 DEFAULT_THRESHOLD로 초기화
 if "default_threshold_pct" not in state:
     state["default_threshold_pct"] = float(DEFAULT_THRESHOLD)
     save_state()
@@ -224,11 +223,13 @@ def set_mode(cid, mode):
 def MAIN_KB(cid=None):
     mode = get_mode(cid) if cid is not None else "coin"
     if mode == "naver":
+        # 네이버 모드 키보드: 즉시 조회 버튼 추가
         return ReplyKeyboardMarkup(
             [
-                ["광고상태", "광고시간", "광고설정"],
-                ["입찰추정", "광고자동", "노출감시"],
-                ["리뷰감시", "도움말", "메뉴"],
+                ["광고상태", "노출현황", "리뷰현황"],
+                ["광고시간", "광고설정", "입찰추정"],
+                ["광고자동", "노출감시", "리뷰감시"],
+                ["도움말", "메뉴"],
             ],
             resize_keyboard=True,
         )
@@ -438,19 +439,20 @@ HELP = (
     "📊 코인 기능\n"
     "• 보기 / 상태 / 코인 / 가격 / 평단 / 수량 / 임계값 / 지정가\n"
     "\n"
-    "📢 네이버 광고 기능 (플레이스#1_광고그룹#1)\n"
-    "• 광고상태 : 입찰가 / 자동 변경 / 시간표 / 입찰추정 / 감시 상태\n"
+    "📢 네이버 광고 기능\n"
+    "• 광고상태 : 현재 입찰/설정/감시 상태 요약\n"
     "• 광고설정 X : 입찰가를 X원으로 즉시 변경 (예: '광고설정 300')\n"
     "• 광고시간 : 'HH:MM/입찰가' 형식으로 시간표 설정 (예: 08:00/300 18:00/500)\n"
     "• 광고자동 : 시간표 자동 적용 켜기/끄기\n"
     "• 입찰추정 : 1순위 추정 입찰가 자동 탐색\n"
-    "• 노출감시 : 광고 영역 제외 플레이스 순위 변동 감시\n"
-    "• 리뷰감시 : NAVER_PLACE_ID 기준 신규 리뷰 감시 (리뷰감시 [분])\n"
-    "   - 예: '리뷰감시' (3분), '리뷰감시 1' (1분), '리뷰감시 5' (5분), '리뷰감시중지'\n"
+    "• 노출감시 : 광고 제외 플레이스 순위 변동 실시간 감시 ON/OFF\n"
+    "• 리뷰감시 : NAVER_PLACE_ID 기준 신규 리뷰 실시간 감시 ON/OFF\n"
+    "• 노출현황 : 현재 플레이스 순위를 즉시 1회 조회\n"
+    "• 리뷰현황 : 현재 리뷰 개수를 즉시 1회 조회\n"
     "\n"
-    "🏨 호텔 : 두젠틀 후기용 3줄 랜덤 문장 생성\n"
+    "🏨 호텔 : 랜덤 후기 3줄 생성\n"
     "\n"
-    "🔧 메뉴 : 인라인 버튼으로 '네이버 광고 / 코인 가격알림' 모드 전환"
+    "🔧 메뉴 : '네이버 광고 / 코인 가격알림' 모드 전환"
 )
 
 # ========= PENDING =========
@@ -1120,6 +1122,64 @@ def naver_review_watch_loop(context):
     else:
         save_state()
 
+# ========= 즉시 조회 기능 =========
+def naver_rank_check_once(update):
+    nav = state.setdefault("naver", {})
+    cfg = nav.setdefault("rank_watch", {})
+    keyword = (cfg.get("keyword") or "").strip()
+    marker = (cfg.get("marker") or "").strip()
+
+    if not (keyword and marker):
+        reply(
+            update,
+            "노출감시 설정이 되어 있지 않습니다.\n"
+            "먼저 '노출감시' 명령으로 키워드와 식별 문구를 설정해 주세요."
+        )
+        return
+
+    try:
+        url = (
+            "https://search.naver.com/search.naver"
+            "?where=nexearch&sm=tab_hty.top&query="
+            + urllib.parse.quote(keyword)
+        )
+        r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
+        html = r.text
+        pos = detect_place_rank_no_ads(html, marker)
+    except Exception as e:
+        print("[NAVER] 노출현황 조회 실패:", e)
+        reply(update, "노출현황 조회 중 오류가 발생했습니다.")
+        return
+
+    if pos is None:
+        reply(
+            update,
+            f"노출현황: 키워드 '{keyword}' 결과에서 지정한 문구를 찾지 못했습니다."
+        )
+    else:
+        cfg["last_rank"] = pos
+        save_state()
+        reply(
+            update,
+            f"노출현황: 키워드 '{keyword}' 기준 현재 순위는 {pos}위입니다."
+        )
+
+def naver_review_check_once(update):
+    if not NAVER_PLACE_ID:
+        reply(update, "NAVER_PLACE_ID가 설정되어 있지 않습니다. .env에 플레이스 ID를 입력하세요.")
+        return
+
+    cnt = get_place_review_count()
+    if cnt is None:
+        reply(update, "리뷰현황 조회 중 오류가 발생했습니다.")
+        return
+
+    nav = state.setdefault("naver", {})
+    cfg = nav.setdefault("review_watch", {})
+    cfg["last_count"] = cnt
+    save_state()
+    reply(update, f"리뷰현황: 현재 네이버 플레이스 리뷰는 총 {cnt}건입니다.")
+
 # ========= INLINE MODE HANDLER =========
 def on_mode_select(update, context):
     q = update.callback_query
@@ -1458,9 +1518,6 @@ def on_text(update, context):
                 reply(update, f"노출감시를 시작합니다. (간격 {sec}초, 광고 제외 순위 기준)")
                 return
 
-        # --- 네이버 리뷰감시 플로우 ---
-        # (별도 다단계 입력은 없고, 명령에서 바로 처리하므로 여기서는 없음)
-
     # ===== 기본 명령 처리 =====
     head = text.split()[0].lstrip("/")
 
@@ -1548,7 +1605,10 @@ def on_text(update, context):
             reply(update, "노출감시용 키워드를 입력하세요. (예: 강남 애견카페)", kb=CANCEL_KB)
         return
 
-    # 리뷰감시: 리뷰감시 [분], 리뷰감시중지
+    if head in ["노출현황","노출조회","노출상태"]:
+        naver_rank_check_once(update)
+        return
+
     if head.startswith("리뷰감시"):
         nav = state.setdefault("naver", {})
         cfg = nav.setdefault("review_watch", {})
@@ -1573,6 +1633,10 @@ def on_text(update, context):
         cfg["enabled"] = False
         save_state()
         reply(update, "리뷰감시를 중지했습니다.")
+        return
+
+    if head in ["리뷰현황","리뷰조회","리뷰상태"]:
+        naver_review_check_once(update)
         return
 
     # 코인 기본 명령
@@ -1727,7 +1791,8 @@ def main():
                     ctx,
                     "봇이 시작되었습니다. '메뉴' 키로 모드를 선택하세요.\n"
                     "- 코인: 보기/상태/코인/지정가\n"
-                    "- 네이버 광고: 광고상태/광고설정/광고시간/광고자동/입찰추정/노출감시/리뷰감시"
+                    "- 네이버 광고: 광고상태/광고설정/광고시간/광고자동/"
+                    "입찰추정/노출감시/리뷰감시/노출현황/리뷰현황"
                 )
         except:
             pass
