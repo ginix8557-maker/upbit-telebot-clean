@@ -13,7 +13,7 @@ CHAT_ID     = str(os.getenv("CHAT_ID", "")).strip()
 DEFAULT_THRESHOLD = float(os.getenv("THRESHOLD_PCT", "1.0"))
 PORT        = int(os.getenv("PORT", "0"))
 
-# Persistent state dir (Render에서는 DATA_DIR=/data 로 설정)
+# Persistent state dir (Render: DATA_DIR=/data)
 DATA_DIR    = os.getenv("DATA_DIR", "").strip() or "."
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -59,14 +59,12 @@ class _Ok(BaseHTTPRequestHandler):
 def _start_keepalive():
     if PORT <= 0:
         return
-
     def _run():
         try:
             httpd = HTTPServer(("", PORT), _Ok)
             httpd.serve_forever()
         except:
             pass
-
     threading.Thread(target=_run, daemon=True).start()
 
 # ========= SINGLE INSTANCE LOCK =========
@@ -440,10 +438,10 @@ HELP = (
     "📢 네이버 광고 기능\n"
     "• 광고상태 : 현재 입찰/설정/감시 상태 요약\n"
     "• 광고설정 X : 입찰가를 X원으로 즉시 변경 (예: '광고설정 300')\n"
-    "• 광고시간 : 'HH:MM/입찰가' 형식으로 시간표 설정 (예: 08:00/300 18:00/500)\n"
+    "• 광고시간 : 'HH:MM/입찰가' 형식으로 시간표 설정\n"
     "• 광고자동 : 시간표 자동 적용 켜기/끄기\n"
     "• 입찰추정 : 1순위 추정 입찰가 자동 탐색\n"
-    "• 노출감시 : 광고 제외 플레이스 순위 변동 실시간 감시 ON/OFF\n"
+    "• 노출감시 : 플레이스 순위 변동 실시간 감시 ON/OFF\n"
     "• 리뷰감시 : NAVER_PLACE_ID 기준 신규 리뷰 실시간 감시 ON/OFF\n"
     "• 노출현황 : 현재 플레이스 순위를 즉시 1회 조회\n"
     "• 리뷰현황 : 현재 리뷰 개수를 즉시 1회 조회\n"
@@ -453,7 +451,7 @@ HELP = (
     "🔧 메뉴 : '네이버 광고 / 코인 가격알림' 모드 전환"
 )
 
-# ========= PENDING (대화 흐름 상태 저장) =========
+# ========= PENDING =========
 def set_pending(cid, action, step="symbol", data=None):
     p = state["pending"].setdefault(str(cid), {})
     p.update({"action": action, "step": step, "data": data or {}})
@@ -960,28 +958,48 @@ def naver_abtest_loop(context):
 
 # ========= NAVER 노출감시 =========
 def detect_place_rank_no_ads(html: str, marker: str):
+    """
+    네이버 검색 결과 HTML에서 광고(추정) 블록을 최대한 제외하고,
+    marker(매장명/식별문구)가 포함된 플레이스 항목의 순위를 계산합니다.
+    구조가 달라져도 동작하도록 완화된 로직 + 폴백 포함.
+    """
     if not marker:
         return None
+    marker = marker.strip()
 
+    # 1) data-cid 기반 플레이스 li 블록 추출
     blocks = []
-    # place 리스트 li 추출
     for m in re.finditer(r'<li[^>]+data-cid="[^"]+"[^>]*>.*?</li>', html, re.S):
         block = m.group(0)
-        # 광고 추정 블록 제외
-        if re.search(r'data-adid=|"ad_flag"|_ad_|"link_ad"', block):
+
+        # 광고로 추정되는 블록: ad 관련 키워드가 있고, marker 는 없는 경우만 제외
+        if re.search(r'adid=|ad_flag|_ad_|"link_ad"|data-ad-?', block, re.I) and (marker not in block):
             continue
+
         blocks.append(block)
 
-    if not blocks:
+    # 2) 추출된 블록에서 marker 검색
+    if blocks:
+        rank = 1
+        for block in blocks:
+            if marker in block:
+                return rank
+            rank += 1
+
+    # 3) 폴백:
+    # marker 위치 기준으로 앞에 등장한 place-li 개수를 세어 순위 추정
+    pos = html.find(marker)
+    if pos < 0:
         return None
 
     rank = 1
-    for block in blocks:
-        if marker in block:
-            return rank
-        rank += 1
+    for m in re.finditer(r'<li[^>]+data-cid="[^"]+"', html):
+        if m.start() < pos:
+            rank += 1
+        else:
+            break
 
-    return None
+    return rank if rank > 0 else None
 
 def naver_rank_watch_loop(context):
     nav = state.setdefault("naver", {})
@@ -1045,7 +1063,6 @@ def get_place_review_count():
     if not NAVER_PLACE_ID:
         return None
     try:
-        # 방문자 리뷰 페이지 기준으로 파싱
         url = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}/review/visitor"
         r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
         html = r.text
@@ -1117,7 +1134,7 @@ def naver_review_watch_loop(context):
     else:
         save_state()
 
-# ========= 즉시 조회 (노출현황 / 리뷰현황) =========
+# ========= 즉시 조회 =========
 def naver_rank_check_once(update):
     nav = state.setdefault("naver", {})
     cfg = nav.setdefault("rank_watch", {})
