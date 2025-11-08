@@ -14,13 +14,14 @@ DEFAULT_THRESHOLD = float(os.getenv("THRESHOLD_PCT", "1.0"))  # 기본 임계값
 PORT        = int(os.getenv("PORT", "0"))                     # keepalive HTTP 포트
 DATA_DIR    = os.getenv("DATA_DIR", "").strip() or "."        # Render: /data
 
-# Naver Searchad API (.env에서 설정)
+# Naver Searchad API
 NAVER_BASE_URL      = "https://api.naver.com"
 NAVER_API_KEY       = os.getenv("NAVER_API_KEY", "").strip()        # 엑세스라이선스
 NAVER_API_SECRET    = os.getenv("NAVER_API_SECRET", "").strip()     # 비밀키
 NAVER_CUSTOMER_ID   = os.getenv("NAVER_CUSTOMER_ID", "").strip()
-NAVER_CAMPAIGN_ID   = os.getenv("NAVER_CAMPAIGN_ID", "").strip()    # (선택) cmp-...
-NAVER_ADGROUP_NAME  = os.getenv("NAVER_ADGROUP_NAME", "").strip()   # 예: 플레이스#1_광고그룹#1
+NAVER_CAMPAIGN_ID   = os.getenv("NAVER_CAMPAIGN_ID", "").strip()    # cmp-...
+NAVER_ADGROUP_ID    = os.getenv("NAVER_ADGROUP_ID", "").strip()     # grp-...
+NAVER_ADGROUP_NAME  = os.getenv("NAVER_ADGROUP_NAME", "").strip()   # 플레이스#1_광고그룹#1
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -62,11 +63,6 @@ def _pid_alive(pid:int) -> bool:
         return False
 
 def _acquire_lock():
-    """
-    DATA_DIR에 lock 파일을 두고,
-    - 살아있는 PID가 있으면 즉시 종료 (중복 실행 방지)
-    - 죽은 PID면 lock 재사용
-    """
     if os.path.exists(LOCK_FILE):
         try:
             with open(LOCK_FILE, "r") as f:
@@ -346,7 +342,7 @@ def view_block(mkt, info, cur):
     sym = mkt.split("-")[1]
     avg = float(info.get("avg_price", 0.0))
     qty = float(info.get("qty", 0.0))
-    buy_amt = avg * qty
+    buy_amt = avg * qty  # 매수총액
     pnl_p = 0.0 if avg == 0 else (cur/avg - 1) * 100
     pnl_w = (cur - avg) * qty
     th    = norm_threshold(info.get("threshold_pct", None))
@@ -465,7 +461,7 @@ def clear_pending(cid):
 def get_pending(cid):
     return state["pending"].get(str(cid))
 
-# ========= ACTION HELPERS =========
+# ========= COIN ACTION HELPERS =========
 def ensure_coin(m):
     c = state["coins"].setdefault(
         m,
@@ -576,11 +572,20 @@ def trigger_clear(symbol):
 
 # ========= NAVER SEARCHAD API HELPERS =========
 def naver_enabled():
-    return bool(NAVER_API_KEY and NAVER_API_SECRET and NAVER_CUSTOMER_ID and NAVER_ADGROUP_NAME)
+    return bool(
+        NAVER_API_KEY and
+        NAVER_API_SECRET and
+        NAVER_CUSTOMER_ID and
+        (NAVER_ADGROUP_ID or NAVER_ADGROUP_NAME)
+    )
 
 def _naver_signature(timestamp, method, uri):
     message = f"{timestamp}.{method}.{uri}"
-    digest = hmac.new(NAVER_API_SECRET.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).digest()
+    digest = hmac.new(
+        NAVER_API_SECRET.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256
+    ).digest()
     return base64.b64encode(digest).decode("utf-8")
 
 def _naver_request(method, uri, params=None, body=None):
@@ -605,9 +610,19 @@ def _naver_request(method, uri, params=None, body=None):
 
 def _naver_get_adgroup_id():
     nav = state.setdefault("naver", {})
+
+    # 1) .env에 NAVER_ADGROUP_ID가 있으면 그걸 최우선 사용
+    if NAVER_ADGROUP_ID:
+        nav["adgroup_id"] = NAVER_ADGROUP_ID
+        save_state()
+        return NAVER_ADGROUP_ID
+
+    # 2) state에 캐시되어 있으면 사용
     if nav.get("adgroup_id"):
         return nav["adgroup_id"]
-    if not naver_enabled():
+
+    # 3) 이름(NAVER_ADGROUP_NAME) 기반으로 검색
+    if not NAVER_ADGROUP_NAME:
         return None
 
     params = {}
@@ -658,7 +673,7 @@ def naver_get_bid():
 def naver_set_bid(new_bid: int):
     adgroup_id = _naver_get_adgroup_id()
     if not adgroup_id:
-        return False, "대상 광고그룹(ID)을 찾지 못했습니다. 이름/캠페인 설정을 확인하세요."
+        return False, "대상 광고그룹(ID)을 찾지 못했습니다. .env 설정을 확인하세요."
 
     r = _naver_request("GET", f"/ncc/adgroups/{adgroup_id}")
     if r.status_code != 200:
@@ -701,7 +716,7 @@ def send_naver_status(update):
             update,
             "네이버 광고 API 정보가 설정되지 않았습니다.\n"
             ".env에 NAVER_API_KEY / NAVER_API_SECRET / NAVER_CUSTOMER_ID / "
-            "NAVER_ADGROUP_NAME / NAVER_CAMPAIGN_ID를 확인하세요."
+            "NAVER_CAMPAIGN_ID / NAVER_ADGROUP_ID / NAVER_ADGROUP_NAME 을 확인하세요."
         )
         return
 
@@ -810,7 +825,7 @@ def trigger_add_mode_kb():
         one_time_keyboard=True,
     )
 
-# ========= HANDLERS =========
+# ========= INLINE MODE HANDLER =========
 def on_mode_select(update, context):
     q = update.callback_query
     cid = q.message.chat_id
@@ -831,6 +846,7 @@ def on_mode_select(update, context):
     else:
         q.answer()
 
+# ========= TEXT HANDLER =========
 def on_text(update, context):
     if not only_owner(update):
         return
@@ -839,10 +855,7 @@ def on_text(update, context):
     cid  = update.effective_chat.id
 
     # 호텔
-    if text == "호텔":
-        update.message.reply_text(build_random_hotel_review())
-        return
-    if text.startswith("/호텔") or text.lower().startswith("/hotel"):
+    if text == "호텔" or text.startswith("/호텔") or text.lower().startswith("/hotel"):
         update.message.reply_text(build_random_hotel_review())
         return
 
@@ -912,7 +925,7 @@ def on_text(update, context):
             clear_pending(cid)
             return
 
-        # 지정가(트리거)
+        # 지정가(트리거) 플로우
         if action == "trigger":
             if step == "symbol":
                 data["symbol"] = text.upper()
@@ -1136,6 +1149,7 @@ def check_loop(context):
         except:
             continue
 
+        # 변동 알림
         if info.get("last_notified_price") is None:
             info["last_notified_price"] = cur
 
@@ -1166,6 +1180,7 @@ def check_loop(context):
                 pass
             info["last_notified_price"] = cur
 
+        # 지정가 트리거 알림
         prev = info.get("prev_price")
         if prev is None:
             info["prev_price"] = cur
@@ -1176,15 +1191,15 @@ def check_loop(context):
         for t in trigs:
             try:
                 t = float(t)
-                up_cross = prev < t <= cur
-                down_cross = prev > t >= cur
+                up_cross   = (prev < t <= cur)
+                down_cross = (prev > t >= cur)
                 if up_cross or down_cross:
                     sym = m.split("-")[1]
                     direction = "🔴 상향" if up_cross else "🔵 하향"
                     try:
                         send_ctx(
                             context,
-                            f"🎯 트리거 도달\n{direction} {sym}: 현재 {fmt(cur)}원 | 트리거 {fmt(t)}원",
+                            f"🎯 트리거 도달\n{direction} {sym}: 현재 {fmt(cur)}원 | 트리거 {fmt(t)}원"
                         )
                     except:
                         pass
