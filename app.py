@@ -12,7 +12,11 @@ BOT_TOKEN   = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID     = str(os.getenv("CHAT_ID", "")).strip()
 DEFAULT_THRESHOLD = float(os.getenv("THRESHOLD_PCT", "1.0"))
 PORT        = int(os.getenv("PORT", "0"))
+
+# DATA_DIR: Render Persistent Disk 등 외부 저장소 사용
+# 환경변수 DATA_DIR이 있으면 그 경로 사용, 없으면 현재 디렉토리(".")
 DATA_DIR    = os.getenv("DATA_DIR", "").strip() or "."
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # Naver Searchad API
 NAVER_BASE_URL      = "https://api.naver.com"
@@ -25,8 +29,6 @@ NAVER_ADGROUP_NAME  = os.getenv("NAVER_ADGROUP_NAME", "").strip()
 
 # Naver Place (리뷰 감시용)
 NAVER_PLACE_ID      = os.getenv("NAVER_PLACE_ID", "").strip()
-
-os.makedirs(DATA_DIR, exist_ok=True)
 
 DATA_FILE = os.path.join(DATA_DIR, "portfolio.json")
 LOCK_FILE = os.path.join(DATA_DIR, "bot.lock")
@@ -195,7 +197,10 @@ def save_state():
 
 state = load_state()
 
-if float(state.get("default_threshold_pct", DEFAULT_THRESHOLD)) != float(DEFAULT_THRESHOLD):
+# ⚠️ 중요: .env 값으로 기존 설정을 덮어쓰지 않도록 수정
+# 처음 실행(파일에 값이 전혀 없을 때)만 DEFAULT_THRESHOLD를 세팅하고,
+# 이후에는 텔레그램에서 변경한 값을 그대로 유지합니다.
+if "default_threshold_pct" not in state:
     state["default_threshold_pct"] = float(DEFAULT_THRESHOLD)
     save_state()
 
@@ -1036,7 +1041,6 @@ def get_place_review_count():
             timeout=5,
         )
         html = r.text
-        # totalReviewCount 또는 reviewCount 또는 화면 텍스트에서 추출 시도
         m = re.search(r'"totalReviewCount"\s*:\s*(\d+)', html)
         if m:
             return int(m.group(1))
@@ -1531,7 +1535,6 @@ def on_text(update, context):
             return
         cfg["enabled"] = True
         cfg["last_check"] = 0.0
-        # last_count는 유지해서 증가분만 볼 수도 있고, 초기화해도 됨. 여기서는 유지.
         save_state()
         iv = int(cfg.get("interval",180))
         reply(update, f"리뷰감시를 시작합니다. {iv//60}분 간격으로 확인합니다.")
