@@ -13,7 +13,7 @@ CHAT_ID     = str(os.getenv("CHAT_ID", "")).strip()
 DEFAULT_THRESHOLD = float(os.getenv("THRESHOLD_PCT", "1.0"))
 PORT        = int(os.getenv("PORT", "0"))
 
-# Persistent state dir
+# Persistent state dir (Render에서는 DATA_DIR=/data 로 설정)
 DATA_DIR    = os.getenv("DATA_DIR", "").strip() or "."
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -33,7 +33,7 @@ DATA_FILE = os.path.join(DATA_DIR, "portfolio.json")
 LOCK_FILE = os.path.join(DATA_DIR, "bot.lock")
 UPBIT     = "https://api.upbit.com/v1"
 
-# Naver 공통 헤더
+# 네이버용 공통 헤더
 NAVER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -151,7 +151,6 @@ def load_state():
     d.setdefault("coins", {})
     d.setdefault("default_threshold_pct", DEFAULT_THRESHOLD)
     d.setdefault("pending", {})
-
     nav = d.setdefault("naver", {})
     nav.setdefault("auto_enabled", False)
     nav.setdefault("schedules", [])
@@ -223,7 +222,6 @@ def set_mode(cid, mode):
 def MAIN_KB(cid=None):
     mode = get_mode(cid) if cid is not None else "coin"
     if mode == "naver":
-        # 네이버 모드 키보드: 즉시 조회 버튼 추가
         return ReplyKeyboardMarkup(
             [
                 ["광고상태", "노출현황", "리뷰현황"],
@@ -455,7 +453,7 @@ HELP = (
     "🔧 메뉴 : '네이버 광고 / 코인 가격알림' 모드 전환"
 )
 
-# ========= PENDING =========
+# ========= PENDING (대화 흐름 상태 저장) =========
 def set_pending(cid, action, step="symbol", data=None):
     p = state["pending"].setdefault(str(cid), {})
     p.update({"action": action, "step": step, "data": data or {}})
@@ -966,23 +964,19 @@ def detect_place_rank_no_ads(html: str, marker: str):
         return None
 
     blocks = []
-    for m in re.finditer(r'data-cid="[^"]+"', html):
-        start = max(0, m.start() - 800)
-        end = m.end() + 800
-        block = html[start:end]
+    # place 리스트 li 추출
+    for m in re.finditer(r'<li[^>]+data-cid="[^"]+"[^>]*>.*?</li>', html, re.S):
+        block = m.group(0)
+        # 광고 추정 블록 제외
+        if re.search(r'data-adid=|"ad_flag"|_ad_|"link_ad"', block):
+            continue
         blocks.append(block)
 
     if not blocks:
         return None
 
-    filtered = []
-    for block in blocks:
-        if (("광고" in block) or ("AD" in block)) and (marker not in block):
-            continue
-        filtered.append(block)
-
     rank = 1
-    for block in filtered:
+    for block in blocks:
         if marker in block:
             return rank
         rank += 1
@@ -1051,7 +1045,8 @@ def get_place_review_count():
     if not NAVER_PLACE_ID:
         return None
     try:
-        url = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}"
+        # 방문자 리뷰 페이지 기준으로 파싱
+        url = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}/review/visitor"
         r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
         html = r.text
 
@@ -1122,7 +1117,7 @@ def naver_review_watch_loop(context):
     else:
         save_state()
 
-# ========= 즉시 조회 기능 =========
+# ========= 즉시 조회 (노출현황 / 리뷰현황) =========
 def naver_rank_check_once(update):
     nav = state.setdefault("naver", {})
     cfg = nav.setdefault("rank_watch", {})
@@ -1609,6 +1604,7 @@ def on_text(update, context):
         naver_rank_check_once(update)
         return
 
+    # 리뷰감시: 리뷰감시 [분], 리뷰감시중지
     if head.startswith("리뷰감시"):
         nav = state.setdefault("naver", {})
         cfg = nav.setdefault("review_watch", {})
@@ -1811,3 +1807,4 @@ if __name__ == "__main__":
         main()
     finally:
         _release_lock()
+
