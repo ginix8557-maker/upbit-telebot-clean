@@ -1,4 +1,4 @@
-import os, json, requests, atexit, signal, threading, random, re, time, base64, hmac, hashlib
+import os, json, requests, atexit, signal, threading, random, re, time, base64, hmac, hashlib, urllib.parse
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
@@ -10,18 +10,18 @@ load_dotenv()
 
 BOT_TOKEN   = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID     = str(os.getenv("CHAT_ID", "")).strip()
-DEFAULT_THRESHOLD = float(os.getenv("THRESHOLD_PCT", "1.0"))  # 기본 임계값
-PORT        = int(os.getenv("PORT", "0"))                     # keepalive HTTP 포트
-DATA_DIR    = os.getenv("DATA_DIR", "").strip() or "."        # Render: /data
+DEFAULT_THRESHOLD = float(os.getenv("THRESHOLD_PCT", "1.0"))
+PORT        = int(os.getenv("PORT", "0"))
+DATA_DIR    = os.getenv("DATA_DIR", "").strip() or "."
 
 # Naver Searchad API
 NAVER_BASE_URL      = "https://api.naver.com"
-NAVER_API_KEY       = os.getenv("NAVER_API_KEY", "").strip()        # 엑세스라이선스
-NAVER_API_SECRET    = os.getenv("NAVER_API_SECRET", "").strip()     # 비밀키
+NAVER_API_KEY       = os.getenv("NAVER_API_KEY", "").strip()
+NAVER_API_SECRET    = os.getenv("NAVER_API_SECRET", "").strip()
 NAVER_CUSTOMER_ID   = os.getenv("NAVER_CUSTOMER_ID", "").strip()
-NAVER_CAMPAIGN_ID   = os.getenv("NAVER_CAMPAIGN_ID", "").strip()    # cmp-...
-NAVER_ADGROUP_ID    = os.getenv("NAVER_ADGROUP_ID", "").strip()     # grp-...
-NAVER_ADGROUP_NAME  = os.getenv("NAVER_ADGROUP_NAME", "").strip()   # 플레이스#1_광고그룹#1
+NAVER_CAMPAIGN_ID   = os.getenv("NAVER_CAMPAIGN_ID", "").strip()
+NAVER_ADGROUP_ID    = os.getenv("NAVER_ADGROUP_ID", "").strip()
+NAVER_ADGROUP_NAME  = os.getenv("NAVER_ADGROUP_NAME", "").strip()
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -100,13 +100,14 @@ def _default_state():
         "default_threshold_pct": DEFAULT_THRESHOLD,
         "pending": {},
         "naver": {
-            "auto_enabled": False,
-            "schedules": [],
-            "last_applied": "",
-            "last_known_bid": None,
-            "adgroup_id": None,
+            "auto_enabled": False,   # 시간표 자동 변경 on/off
+            "schedules": [],         # [{time:"HH:MM", bid:int}, ...]
+            "last_applied": "",      # 마지막 적용 키
+            "last_known_bid": None,  # 마지막 조회 입찰가
+            "adgroup_id": None,      # 캐시된 nccAdgroupId
+            "abtest": None,          # 입찰추정 설정
         },
-        "modes": {},  # chat_id -> "coin" / "naver"
+        "modes": {},                # chat_id -> "coin" / "naver"
     }
 
 def load_state():
@@ -127,9 +128,10 @@ def load_state():
     naver.setdefault("last_applied", "")
     naver.setdefault("last_known_bid", None)
     naver.setdefault("adgroup_id", None)
+    naver.setdefault("abtest", None)
     d.setdefault("modes", {})
 
-    # 과거 target/stop 필드 → triggers 마이그레이션
+    # 옛 필드 마이그레이션
     changed = False
     for m, info in d["coins"].items():
         info.setdefault("triggers", [])
@@ -161,19 +163,16 @@ def save_state():
 
 state = load_state()
 
-# .env 기본값 동기화
 if float(state.get("default_threshold_pct", DEFAULT_THRESHOLD)) != float(DEFAULT_THRESHOLD):
     state["default_threshold_pct"] = float(DEFAULT_THRESHOLD)
     save_state()
 
-# ========= MODE / KEYBOARDS =========
+# ========= MODE / KEYBOARD =========
 def get_mode(cid):
-    modes = state.setdefault("modes", {})
-    return modes.get(str(cid), "coin")
+    return state.setdefault("modes", {}).get(str(cid), "coin")
 
 def set_mode(cid, mode):
-    modes = state.setdefault("modes", {})
-    modes[str(cid)] = mode
+    state.setdefault("modes", {})[str(cid)] = mode
     save_state()
 
 def MAIN_KB(cid=None):
@@ -182,7 +181,8 @@ def MAIN_KB(cid=None):
         return ReplyKeyboardMarkup(
             [
                 ["광고상태", "광고시간", "광고설정"],
-                ["광고자동", "도움말", "메뉴"],
+                ["입찰추정", "광고자동", "도움말"],
+                ["메뉴"],
             ],
             resize_keyboard=True,
         )
@@ -254,7 +254,6 @@ def norm_threshold(th):
     except:
         return float(state.get("default_threshold_pct", DEFAULT_THRESHOLD))
 
-# 이모지 규칙
 def status_emoji(info, cur):
     avg = float(info.get("avg_price", 0.0))
     qty = float(info.get("qty", 0.0))
@@ -290,7 +289,7 @@ def pretty_sym(sym: str) -> str:
     e = status_emoji(info, cur) if info else "⚪️"
     return f"{e} {sym} {e}"
 
-# ========= 정렬 로직 =========
+# ========= 코인 정렬/포맷 =========
 def sorted_coin_items():
     items = []
     for m, info in state["coins"].items():
@@ -320,7 +319,6 @@ def sorted_coin_items():
     items.sort(key=lambda x: (x[0], x[1], x[2]))
     return items
 
-# ========= SUMMARY / FORMATTERS =========
 def format_triggers(info):
     trigs = info.get("triggers", [])
     return "없음" if not trigs else " | ".join(fmt(t) for t in sorted(set(trigs)))
@@ -342,7 +340,7 @@ def view_block(mkt, info, cur):
     sym = mkt.split("-")[1]
     avg = float(info.get("avg_price", 0.0))
     qty = float(info.get("qty", 0.0))
-    buy_amt = avg * qty  # 매수총액
+    buy_amt = avg * qty
     pnl_p = 0.0 if avg == 0 else (cur/avg - 1) * 100
     pnl_w = (cur - avg) * qty
     th    = norm_threshold(info.get("threshold_pct", None))
@@ -355,7 +353,7 @@ def view_block(mkt, info, cur):
     )
     return head + "\n" + line1 + "\n" + line2
 
-# ========= RANDOM HOTEL REVIEW (호텔) =========
+# ========= HOTEL (호텔 명령: 슬래시 없이 '호텔') =========
 REVIEWS = [
     [
         "{휴가기간|일주일|며칠|주말} 동안 맡겼는데 너무 좋았어요!",
@@ -372,41 +370,6 @@ REVIEWS = [
         "하루에도 몇 번씩 사진과 영상 보내주셔서 걱정이 싹 사라졌어요.",
         "사장님이 너무 친절해서 믿음이 가는 곳이에요."
     ],
-    [
-        "{휴가기간|일주일|며칠|연휴} 동안 맡겼는데 대만족이에요!",
-        "시설도 깨끗하고 아이가 즐겁게 노는 모습이 영상으로 와서 행복했어요.",
-        "두젠틀은 진짜 믿고 맡길 수 있는 곳이에요."
-    ],
-    [
-        "{한 달|휴가기간|며칠|일주일} 동안 맡겼는데 너무 만족스러웠어요.",
-        "영상으로 아이가 노는 모습 보내주셔서 매일 안심됐어요.",
-        "시설도 깔끔하고 사장님도 세심하게 케어해주셨어요."
-    ],
-    [
-        "{며칠|휴가기간|연휴|주말} 동안 이용했는데 최고였어요.",
-        "사진이랑 영상으로 아이 근황 알려주셔서 든든했어요.",
-        "시설도 깨끗하고 아이가 밝아져서 너무 만족입니다."
-    ],
-    [
-        "{휴가기간|일주일|3일|며칠} 동안 맡겼는데 정말 마음에 들었어요.",
-        "영상으로 아이 상태를 바로 확인할 수 있어서 걱정이 줄었어요.",
-        "사장님이 세심하게 챙겨주셔서 믿고 맡길 수 있었습니다."
-    ],
-    [
-        "{한 달|휴가기간|며칠|연휴} 동안 맡겼는데 너무 좋았어요.",
-        "사진, 영상으로 아이 소식을 자주 받아서 마음이 편했어요.",
-        "시설도 깨끗하고 케어가 꼼꼼해서 정말 만족했어요."
-    ],
-    [
-        "{일주일|휴가기간|며칠|연휴} 동안 맡겼는데 완전 만족이에요.",
-        "아이 영상을 수시로 보내주셔서 매일 안심됐어요.",
-        "시설도 좋고 분위기도 밝아서 또 맡길 예정이에요."
-    ],
-    [
-        "{한 달|휴가기간|며칠|주말} 동안 맡겼는데 진짜 최고였어요.",
-        "하루에도 여러 번 사진, 영상 보내주셔서 믿음이 갔어요.",
-        "아이도 행복해 보여서 또 이용하려구요."
-    ],
 ]
 
 def _expand_braces(text: str) -> str:
@@ -421,9 +384,10 @@ def build_random_hotel_review() -> str:
     line3 = _expand_braces(random.choice(REVIEWS)[2])
     return "\n".join([line1, line2, line3])
 
+# ========= HELP =========
 HELP = (
     "📖 도움말\n"
-    "• 버튼 또는 한글 명령으로 실행합니다. (슬래시 / 사용 안 함)\n"
+    "• 모든 명령은 한글로, 슬래시(/) 없이 입력합니다.\n"
     "\n"
     "📊 코인 기능\n"
     "• 보기 : 보유 현황 (보유 코인 매수총액 순 정렬)\n"
@@ -435,11 +399,12 @@ HELP = (
     "• 임계값 : 기본/개별 변동 임계값 설정\n"
     "• 지정가 : 트리거(지정가) 추가/삭제/목록/초기화\n"
     "\n"
-    "📢 네이버 광고 기능 (플레이스#1_광고그룹#1 대상)\n"
-    "• 광고상태 : 현재 입찰가 / 자동 변경 설정 / 시간표 확인\n"
-    "• 광고설정 : 즉시 입찰가 변경 (예: '광고설정 400')\n"
-    "• 광고시간 : 'HH:MM/입찰가' 형식으로 자동 변경 시간표 등록\n"
-    "• 광고자동 : 자동 변경 켜기/끄기 토글\n"
+    "📢 네이버 광고 기능 (플레이스#1_광고그룹#1)\n"
+    "• 광고상태 : 현재 입찰가 / 자동 변경 설정 / 시간표 / 입찰추정 상태 조회\n"
+    "• 광고설정 X : 입찰가를 X원으로 즉시 변경 (예: '광고설정 300')\n"
+    "• 광고시간 : 'HH:MM/입찰가' 형식으로 자동 변경 시간표 설정 (예: 08:00/300 18:00/500)\n"
+    "• 광고자동 : 자동 변경 켜기/끄기\n"
+    "• 입찰추정 : 검색어/시작가/쿨타임/최대가를 받아 1순위 추정 입찰가 자동 탐색\n"
     "\n"
     "🏨 호텔 기능\n"
     "• 호텔 : 두젠틀 후기용 3줄 랜덤 문장 생성\n"
@@ -466,13 +431,13 @@ def ensure_coin(m):
     c = state["coins"].setdefault(
         m,
         {
-            "avg_price": 0.0,
-            "qty": 0.0,
-            "threshold_pct": None,
-            "last_notified_price": None,
-            "prev_price": None,
-            "triggers": [],
-        },
+            "avg_price":0.0,
+            "qty":0.0,
+            "threshold_pct":None,
+            "last_notified_price":None,
+            "prev_price":None,
+            "triggers":[]
+        }
     )
     c.setdefault("triggers", [])
     c.setdefault("prev_price", None)
@@ -548,7 +513,7 @@ def trigger_add(symbol, mode, value):
             if base <= 0:
                 raise ValueError("평단가가 없습니다.")
         pct = float(value)
-        target = base * (1 + pct / 100.0)
+        target = base * (1 + pct/100.0)
     c["triggers"].append(float(target))
     save_state()
     return target
@@ -570,20 +535,18 @@ def trigger_clear(symbol):
     save_state()
     return n
 
-# ========= NAVER SEARCHAD API HELPERS =========
+# ========= NAVER API HELPERS =========
 def naver_enabled():
     return bool(
-        NAVER_API_KEY and
-        NAVER_API_SECRET and
-        NAVER_CUSTOMER_ID and
+        NAVER_API_KEY and NAVER_API_SECRET and NAVER_CUSTOMER_ID and
         (NAVER_ADGROUP_ID or NAVER_ADGROUP_NAME)
     )
 
 def _naver_signature(timestamp, method, uri):
-    message = f"{timestamp}.{method}.{uri}"
+    msg = f"{timestamp}.{method}.{uri}"
     digest = hmac.new(
         NAVER_API_SECRET.encode("utf-8"),
-        message.encode("utf-8"),
+        msg.encode("utf-8"),
         hashlib.sha256
     ).digest()
     return base64.b64encode(digest).decode("utf-8")
@@ -611,17 +574,14 @@ def _naver_request(method, uri, params=None, body=None):
 def _naver_get_adgroup_id():
     nav = state.setdefault("naver", {})
 
-    # 1) .env에 NAVER_ADGROUP_ID가 있으면 그걸 최우선 사용
     if NAVER_ADGROUP_ID:
         nav["adgroup_id"] = NAVER_ADGROUP_ID
         save_state()
         return NAVER_ADGROUP_ID
 
-    # 2) state에 캐시되어 있으면 사용
     if nav.get("adgroup_id"):
         return nav["adgroup_id"]
 
-    # 3) 이름(NAVER_ADGROUP_NAME) 기반으로 검색
     if not NAVER_ADGROUP_NAME:
         return None
 
@@ -636,7 +596,7 @@ def _naver_get_adgroup_id():
         return None
 
     if r.status_code != 200:
-        print("[NAVER] adgroups 조회 실패 status:", r.status_code, r.text)
+        print("[NAVER] adgroups 조회 실패:", r.status_code, r.text)
         return None
 
     try:
@@ -650,19 +610,17 @@ def _naver_get_adgroup_id():
             save_state()
             return nav["adgroup_id"]
 
-    print("[NAVER] 대상 광고그룹 이름을 찾지 못했습니다:", NAVER_ADGROUP_NAME)
+    print("[NAVER] 대상 광고그룹 이름 없음:", NAVER_ADGROUP_NAME)
     return None
 
 def naver_get_bid():
     adgroup_id = _naver_get_adgroup_id()
     if not adgroup_id:
         return None
-
     r = _naver_request("GET", f"/ncc/adgroups/{adgroup_id}")
     if r.status_code != 200:
-        print("[NAVER] adgroup 단건 조회 실패:", r.status_code, r.text)
+        print("[NAVER] adgroup 조회 실패:", r.status_code, r.text)
         return None
-
     data = r.json()
     bid = data.get("bidAmt")
     nav = state.setdefault("naver", {})
@@ -746,9 +704,16 @@ def send_naver_status(update):
     last = nav.get("last_applied") or "없음"
     lines.append(f"- 마지막 자동 적용: {last}")
 
+    ab = nav.get("abtest") or {}
+    if ab.get("status") == "running":
+        lines.append(
+            f"- 입찰추정: 진행 중 (키워드 '{ab.get('keyword','')}', "
+            f"현재 {ab.get('current_bid')}원, 간격 {ab.get('interval')}초)"
+        )
+
     reply(update, "\n".join(lines))
 
-# ========= NAVER SCHEDULE LOOP =========
+# ========= NAVER 시간표 자동 변경 LOOP =========
 def naver_schedule_loop(context):
     if not naver_enabled():
         return
@@ -785,6 +750,167 @@ def naver_schedule_loop(context):
             except:
                 pass
 
+# ========= NAVER 입찰추정 (자동 1순위 탐색) =========
+def detect_ad_position(html: str, marker: str):
+    # 매우 단순한 휴리스틱:
+    # - marker 문자열 위치 기준으로, 그 앞에 나오는 data-cr-rank="N" 중 마지막 값을 순위로 사용
+    # - 네이버 페이지 구조 변경 시 오동작할 수 있음 (실사용 시 확인 필요)
+    if not marker:
+        return None
+    idx = html.find(marker)
+    if idx < 0:
+        return None
+    pos = None
+    for m in re.finditer(r'data-cr-rank="(\\d+)"', html):
+        i = m.start()
+        r = int(m.group(1))
+        if i < idx:
+            pos = r
+        else:
+            break
+    if pos is None:
+        return 1
+    return pos
+
+def start_naver_abtest(cid, keyword, marker, start_bid, max_bid, step, interval):
+    nav = state.setdefault("naver", {})
+    nav["abtest"] = {
+        "chat_id": cid,
+        "keyword": keyword,
+        "marker": marker,
+        "current_bid": int(start_bid),
+        "max_bid": int(max_bid),
+        "step": int(step),
+        "interval": int(interval),
+        "last_check": 0,
+        "phase": "set",      # set -> check 반복
+        "status": "running",
+    }
+    save_state()
+
+def naver_abtest_loop(context):
+    nav = state.setdefault("naver", {})
+    ab = nav.get("abtest")
+    if not ab or ab.get("status") != "running":
+        return
+
+    cid = ab.get("chat_id")
+    now = time.time()
+    interval = int(ab.get("interval", 60))
+    step = int(ab.get("step", 10))
+    cur_bid = int(ab.get("current_bid", 0))
+    max_bid = int(ab.get("max_bid", 0))
+    keyword = ab.get("keyword", "")
+    marker = ab.get("marker", "")
+    phase = ab.get("phase", "set")
+
+    if not (cid and keyword and cur_bid > 0 and step > 0):
+        ab["status"] = "stopped"
+        save_state()
+        return
+
+    # 1) 입찰 설정 단계
+    if phase == "set":
+        success, msg = naver_set_bid(cur_bid)
+        if not success:
+            ab["status"] = "stopped"
+            save_state()
+            try:
+                context.bot.send_message(
+                    chat_id=cid,
+                    text=f"⚠️ [입찰추정 종료] 입찰 설정 실패: {msg}",
+                    reply_markup=MAIN_KB(cid),
+                )
+            except:
+                pass
+            return
+
+        ab["phase"] = "check"
+        ab["last_check"] = now
+        save_state()
+        try:
+            context.bot.send_message(
+                chat_id=cid,
+                text=f"🔧 [입찰추정] {cur_bid}원으로 설정. {interval}초 후 노출 위치 확인.",
+                reply_markup=MAIN_KB(cid),
+            )
+        except:
+            pass
+        return
+
+    # 2) 순위 확인 단계
+    if phase == "check":
+        last = float(ab.get("last_check", 0))
+        if now - last < interval:
+            return
+
+        html = ""
+        try:
+            url = (
+                "https://search.naver.com/search.naver"
+                "?where=nexearch&sm=tab_hty.top&query="
+                + urllib.parse.quote(keyword)
+            )
+            r = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=5,
+            )
+            html = r.text
+        except Exception as e:
+            print("[NAVER] 검색 결과 조회 실패:", e)
+
+        pos = detect_ad_position(html, marker) if html else None
+
+        if pos == 1:
+            ab["status"] = "done"
+            save_state()
+            try:
+                context.bot.send_message(
+                    chat_id=cid,
+                    text=(
+                        f"✅ [입찰추정 완료]\\n"
+                        f"키워드 '{keyword}' 1순위 추정 입찰가: {cur_bid}원\\n"
+                        f"(검색 페이지 구조/상황에 따라 실제와 다를 수 있습니다.)"
+                    ),
+                    reply_markup=MAIN_KB(cid),
+                )
+            except:
+                pass
+            return
+
+        # 1순위가 아니거나 위치 판단 실패 → 입찰 인상 후 재시도
+        next_bid = cur_bid + step
+        if max_bid and next_bid > max_bid:
+            ab["status"] = "done"
+            save_state()
+            try:
+                context.bot.send_message(
+                    chat_id=cid,
+                    text=(
+                        f"⚠️ [입찰추정 종료]\\n"
+                        f"최대 입찰가 {max_bid}원을 초과하여 중단했습니다.\\n"
+                        f"현재 {cur_bid}원까지 올렸지만 1순위로 추정되지 않습니다."
+                    ),
+                    reply_markup=MAIN_KB(cid),
+                )
+            except:
+                pass
+            return
+
+        ab["current_bid"] = next_bid
+        ab["phase"] = "set"
+        ab["last_check"] = now
+        save_state()
+        try:
+            context.bot.send_message(
+                chat_id=cid,
+                text=f"ℹ️ [입찰추정] 1순위 아님 → {next_bid}원으로 재시도합니다.",
+                reply_markup=MAIN_KB(cid),
+            )
+        except:
+            pass
+
 # ========= VIEW / STATUS =========
 def send_view(update):
     if not state["coins"]:
@@ -810,7 +936,7 @@ def send_status(update):
         rows.append(status_line(m, info, cur))
     reply(update, (header + "\n".join(rows))[:4000])
 
-# ========= TRIGGER MENU KEYBOARDS =========
+# ========= TRIGGER 메뉴 키보드 =========
 def trigger_menu_kb():
     return ReplyKeyboardMarkup(
         [["추가", "삭제"], ["목록", "초기화"], ["취소"]],
@@ -872,8 +998,8 @@ def on_text(update, context):
 
         # 코인 추가/삭제 모드 선택
         if action == "coin" and step == "mode":
-            if text not in ["추가", "삭제"]:
-                reply(update, "‘추가/삭제’ 중 선택하세요.", kb=COIN_MODE_KB)
+            if text not in ["추가","삭제"]:
+                reply(update,"‘추가/삭제’ 중 선택하세요.", kb=COIN_MODE_KB)
             else:
                 next_action = "coin_add" if text == "추가" else "coin_del"
                 set_pending(cid, next_action, "symbol", {})
@@ -881,7 +1007,7 @@ def on_text(update, context):
             return
 
         # 코인 추가/삭제 실행
-        if action in ["coin_add", "coin_del"] and step == "symbol":
+        if action in ["coin_add","coin_del"] and step == "symbol":
             symbol = text.upper()
             if action == "coin_add":
                 act_add(update, symbol)
@@ -891,7 +1017,7 @@ def on_text(update, context):
             return
 
         # 가격/평단/수량/개별 임계값: 심볼 입력 단계
-        if step == "symbol" and action in ["price", "setavg", "setqty", "setrate_coin"]:
+        if step == "symbol" and action in ["price","setavg","setqty","setrate_coin"]:
             symbol = text.upper()
             data["symbol"] = symbol
             if action == "price":
@@ -900,22 +1026,22 @@ def on_text(update, context):
             else:
                 set_pending(cid, action, "value", data)
                 label = {
-                    "setavg": "평단가(원)",
-                    "setqty": "수량",
-                    "setrate_coin": "임계값(%)",
+                    "setavg":"평단가(원)",
+                    "setqty":"수량",
+                    "setrate_coin":"임계값(%)"
                 }[action]
                 reply(update, f"{symbol} {label} 값을 숫자로 입력하세요.", kb=CANCEL_KB)
             return
 
-        # 값 입력 단계 (코인 설정)
-        if step == "value" and action in ["setavg", "setqty", "setrate_coin"]:
+        # 값 입력 단계
+        if step == "value" and action in ["setavg","setqty","setrate_coin"]:
             v = text.replace(",", "")
             try:
                 float(v)
             except:
-                reply(update, "숫자만 입력하세요. 취소는 ‘취소’", kb=CANCEL_KB)
+                reply(update,"숫자만 입력하세요. 취소는 ‘취소’", kb=CANCEL_KB)
                 return
-            symbol = data.get("symbol", "")
+            symbol = data.get("symbol","")
             if action == "setavg":
                 act_setavg(update, symbol, v)
             elif action == "setqty":
@@ -925,7 +1051,7 @@ def on_text(update, context):
             clear_pending(cid)
             return
 
-        # 지정가(트리거) 플로우
+        # 지정가(트리거)
         if action == "trigger":
             if step == "symbol":
                 data["symbol"] = text.upper()
@@ -934,28 +1060,30 @@ def on_text(update, context):
                 return
 
             if step == "menu":
-                if text not in ["추가", "삭제", "목록", "초기화", "취소"]:
+                if text not in ["추가","삭제","목록","초기화","취소"]:
                     reply(update, "‘추가/삭제/목록/초기화/취소’ 중 선택하세요.", kb=trigger_menu_kb())
                     return
                 sym = data["symbol"]
+
                 if text == "목록":
-                    m = krw_symbol(sym)
-                    c = ensure_coin(m)
+                    m = krw_symbol(sym); c = ensure_coin(m)
                     reply(update, _trigger_list_text(c), kb=trigger_menu_kb())
                     return
+
                 if text == "초기화":
                     n = trigger_clear(sym)
                     reply(update, f"트리거 {n}개 삭제됨.", kb=trigger_menu_kb())
                     return
+
                 if text == "삭제":
-                    m = krw_symbol(sym)
-                    c = ensure_coin(m)
+                    m = krw_symbol(sym); c = ensure_coin(m)
                     if not c.get("triggers"):
                         reply(update, "등록된 트리거가 없습니다.", kb=trigger_menu_kb())
                         return
                     set_pending(cid, "trigger", "delete_select", data)
-                    reply(update, _trigger_list_text(c) + "\n삭제할 번호를 입력(예: 1 또는 1,3)", kb=CANCEL_KB)
+                    reply(update, _trigger_list_text(c)+"\n삭제할 번호를 입력(예: 1 또는 1,3)", kb=CANCEL_KB)
                     return
+
                 if text == "추가":
                     set_pending(cid, "trigger", "add_mode", data)
                     reply(update, "입력 방식을 선택하세요.", kb=trigger_add_mode_kb())
@@ -963,7 +1091,7 @@ def on_text(update, context):
 
             if step == "delete_select":
                 nums = []
-                for part in text.replace(" ", "").split(","):
+                for part in text.replace(" ","").split(","):
                     if part.isdigit():
                         nums.append(int(part))
                 if not nums:
@@ -975,25 +1103,25 @@ def on_text(update, context):
                 return
 
             if step == "add_mode":
-                if text not in ["직접가격", "현재가±%", "평단가±%"]:
-                    reply(update, "‘직접가격/현재가±%/평단가±%’ 중 선택하세요.", kb=trigger_add_mode_kb())
+                if text not in ["직접가격","현재가±%","평단가±%"]:
+                    reply(update,"‘직접가격/현재가±%/평단가±%’ 중 선택하세요.", kb=trigger_add_mode_kb())
                     return
                 data["mode"] = (
-                    "direct" if text == "직접가격"
-                    else "cur_pct" if text == "현재가±%"
-                    else "avg_pct"
+                    "direct"  if text == "직접가격" else
+                    "cur_pct" if text == "현재가±%" else
+                    "avg_pct"
                 )
                 set_pending(cid, "trigger", "add_value", data)
-                msg = "가격(원)을 입력하세요." if data["mode"] == "direct" else "변화율(%)을 입력하세요. 예: 5 또는 -5"
+                msg = "가격(원)을 입력하세요." if data["mode"]=="direct" else "변화율(%)을 입력하세요. 예: 5 또는 -5"
                 reply(update, msg, kb=CANCEL_KB)
                 return
 
             if step == "add_value":
-                v = text.replace("%", "").replace(",", "")
+                v = text.replace("%","").replace(",","")
                 try:
                     float(v)
                 except:
-                    reply(update, "숫자만 입력하세요.", kb=CANCEL_KB)
+                    reply(update,"숫자만 입력하세요.", kb=CANCEL_KB)
                     return
                 try:
                     trg = trigger_add(data["symbol"], data["mode"], float(v))
@@ -1004,7 +1132,7 @@ def on_text(update, context):
                 reply(update, f"트리거 등록: {data['symbol'].upper()} {fmt(trg)}원")
                 return
 
-        # 네이버 광고: 수동 입찰 변경
+        # 네이버: 수동 입찰 변경
         if action == "naver_manual" and step == "value":
             v = text.replace(",", "")
             try:
@@ -1017,7 +1145,7 @@ def on_text(update, context):
             reply(update, f"✅ {msg}" if success else f"⚠️ {msg}")
             return
 
-        # 네이버 광고: 시간표 설정
+        # 네이버: 시간표 설정
         if action == "naver_schedule" and step == "input":
             raw = text.replace("\n", " ").strip()
             parts = [p for p in raw.split() if p]
@@ -1043,13 +1171,78 @@ def on_text(update, context):
             save_state()
             clear_pending(cid)
             status = "켜짐" if nav["auto_enabled"] else "꺼짐"
-            reply(update, f"자동 변경 시간표가 저장되었습니다. (자동 변경 현재 상태: {status})")
+            reply(update, f"자동 변경 시간표 저장 완료. (자동 변경 현재: {status})")
             return
+
+        # 네이버: 입찰추정 설정 플로우
+        if action == "naver_abtest":
+            if step == "keyword":
+                data["keyword"] = text.strip()
+                set_pending(cid, "naver_abtest", "start_bid", data)
+                reply(update, "입찰 추정을 시작할 '시작 입찰가(원)'를 입력하세요.", kb=CANCEL_KB)
+                return
+
+            if step == "start_bid":
+                v = text.replace(",", "")
+                try:
+                    start_bid = int(v)
+                except:
+                    reply(update, "숫자만 입력하세요. 취소는 ‘취소’", kb=CANCEL_KB)
+                    return
+                data["start_bid"] = start_bid
+                set_pending(cid, "naver_abtest", "marker", data)
+                reply(update, "검색 결과에서 내 광고를 식별할 문구를 입력하세요.\n예: '두젠틀 예약카페 강남'", kb=CANCEL_KB)
+                return
+
+            if step == "marker":
+                data["marker"] = text.strip()
+                set_pending(cid, "naver_abtest", "interval", data)
+                reply(update, "노출위치 확인 간격(초)을 입력하세요. (권장 60)", kb=CANCEL_KB)
+                return
+
+            if step == "interval":
+                v = text.strip()
+                if v:
+                    try:
+                        interval = max(10, int(v))
+                    except:
+                        interval = 60
+                else:
+                    interval = 60
+                data["interval"] = interval
+                set_pending(cid, "naver_abtest", "max_bid", data)
+                reply(update, "최대 입찰가(원)를 입력하세요. (이 금액을 넘기면 추정을 중단합니다.)", kb=CANCEL_KB)
+                return
+
+            if step == "max_bid":
+                v = text.replace(",", "")
+                try:
+                    max_bid = int(v)
+                except:
+                    start_bid = int(data.get("start_bid", 0))
+                    max_bid = start_bid + 200
+                keyword = data.get("keyword", "")
+                marker = data.get("marker", "")
+                start_bid = int(data.get("start_bid", 0))
+                interval = int(data.get("interval", 60))
+                step_bid = 10  # 10원 단위
+                clear_pending(cid)
+                start_naver_abtest(cid, keyword, marker, start_bid, max_bid, step_bid, interval)
+                reply(
+                    update,
+                    f"입찰추정을 시작합니다.\n"
+                    f"- 키워드: {keyword}\n"
+                    f"- 시작 입찰가: {start_bid}원\n"
+                    f"- 최대 입찰가: {max_bid}원\n"
+                    f"- 확인 간격: {interval}초\n"
+                    f"- 상승 단위: {step_bid}원",
+                )
+                return
 
     # ===== 기본 명령 처리 =====
     head = text.split()[0].lstrip("/")
 
-    if head in ["도움말", "help"]:
+    if head in ["도움말","help"]:
         reply(update, HELP)
         return
 
@@ -1057,15 +1250,15 @@ def on_text(update, context):
         update.message.reply_text("모드를 선택하세요.", reply_markup=mode_inline_kb())
         return
 
-    if head in ["보기", "show"]:
+    if head in ["보기","show"]:
         send_view(update)
         return
 
-    if head in ["상태", "status"]:
+    if head in ["상태","status"]:
         send_status(update)
         return
 
-    # 네이버 광고
+    # 네이버 광고 모듈
     if head == "광고상태":
         send_naver_status(update)
         return
@@ -1098,7 +1291,12 @@ def on_text(update, context):
         reply(update, f"네이버 광고 자동 변경이 '{status}' 상태입니다.")
         return
 
-    # 코인
+    if head in ["입찰추정","자동입찰"]:
+        set_pending(cid, "naver_abtest", "keyword", {})
+        reply(update, "입찰 추정을 위한 검색어를 입력하세요.", kb=CANCEL_KB)
+        return
+
+    # 코인 모듈
     if head == "코인":
         set_pending(cid, "coin", "mode", {})
         reply(update, "코인 관리 방식을 선택하세요.", kb=COIN_MODE_KB)
@@ -1122,7 +1320,7 @@ def on_text(update, context):
     if head == "임계값":
         parts = text.split()
         if len(parts) == 2:
-            v = parts[1].replace(",", "")
+            v = parts[1].replace(",","")
             try:
                 act_setrate_default(update, float(v))
                 return
@@ -1154,24 +1352,24 @@ def check_loop(context):
             info["last_notified_price"] = cur
 
         base = info.get("last_notified_price", cur)
-        th = norm_threshold(info.get("threshold_pct", None))
+        th   = norm_threshold(info.get("threshold_pct", None))
 
         try:
-            delta = abs(cur / base - 1) * 100
+            delta = abs(cur/base - 1) * 100
         except:
             delta = 0
 
         if base > 0 and delta >= th:
-            up_flag = cur > base
-            arrow = "🔴" if up_flag else "🔵"
+            up = cur > base
+            arrow = "🔴" if up else "🔵"
             sym = m.split("-")[1]
             avg = float(info.get("avg_price", 0.0))
             qty = float(info.get("qty", 0.0))
             pnl_w = (cur - avg) * qty
-            pnl_p = 0.0 if avg == 0 else (cur / avg - 1) * 100
+            pnl_p = 0.0 if avg == 0 else (cur/avg - 1) * 100
             msg = (
                 f"📈 변동 알림({th}%) {arrow}\n"
-                f"{pretty_sym(sym)}: {fmt(base)} → {fmt(cur)} 원 ({(cur / base - 1) * 100:+.2f}%)\n"
+                f"{pretty_sym(sym)}: {fmt(base)} → {fmt(cur)} 원 ({(cur/base-1)*100:+.2f}%)\n"
                 f"평가손익:{pnl_p:+.2f}%  평가금액:{fmt(pnl_w)}"
             )
             try:
@@ -1234,17 +1432,21 @@ def main():
     dp.add_handler(MessageHandler(Filters.text & (~Filters.command), on_text))
     dp.add_handler(MessageHandler(Filters.command, on_text))
 
+    # 코인 체크
     up.job_queue.run_repeating(check_loop, interval=3, first=3)
+    # 네이버 시간표 자동 변경
     up.job_queue.run_repeating(naver_schedule_loop, interval=30, first=10)
+    # 입찰추정 루프 (내부에서 간격 체크)
+    up.job_queue.run_repeating(naver_abtest_loop, interval=15, first=15)
 
     def hi(ctx):
         try:
             if CHAT_ID:
                 send_ctx(
                     ctx,
-                    "봇이 시작되었습니다. '메뉴' 키 또는 명령으로 모드를 선택하세요.\n"
+                    "봇이 시작되었습니다. '메뉴' 키로 모드를 선택하세요.\n"
                     "- 코인: 보기/상태/코인/지정가\n"
-                    "- 네이버 광고: 광고상태/광고설정/광고시간/광고자동",
+                    "- 네이버 광고: 광고상태/광고설정/광고시간/광고자동/입찰추정"
                 )
         except:
             pass
