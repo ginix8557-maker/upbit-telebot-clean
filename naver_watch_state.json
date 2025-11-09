@@ -1,0 +1,22 @@
+{
+  "naver": {
+    "rank_watch": {
+      "enabled": true,
+      "keyword": "강남 애견카페",
+      "marker": "두젠틀",
+      "interval": 300,
+      "last_rank": 3,
+      "last_check": 0.0
+    },
+    "review_watch": {
+      "enabled": true,
+      "interval": 180,
+      "last_count": 488,
+      "last_check": 1762677234.2599099,
+      "last_total": null,
+      "last_visitor": null,
+      "last_blog": null
+    }
+  },
+  "pending": {}
+}

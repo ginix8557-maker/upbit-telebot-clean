@@ -1,5 +1,7 @@
+# app.py
 import os, json, requests, atexit, signal, threading, random, re, time, base64, hmac, hashlib, urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+KST = timezone(timedelta(hours=9))
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telegram import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
@@ -35,8 +37,8 @@ UPBIT     = "https://api.upbit.com/v1"
 
 NAVER_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        "Mozilla/5.0 (Linux; Android 12; SM-G998N) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
     ),
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
@@ -74,6 +76,13 @@ def _pid_alive(pid:int) -> bool:
     except:
         return False
 
+def _release_lock():
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except:
+        pass
+
 def _acquire_lock():
     if os.path.exists(LOCK_FILE):
         try:
@@ -87,13 +96,6 @@ def _acquire_lock():
     with open(LOCK_FILE, "w") as f:
         f.write(str(os.getpid()))
     atexit.register(_release_lock)
-
-def _release_lock():
-    try:
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
-    except:
-        pass
 
 def _setup_signals():
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -123,7 +125,7 @@ def _default_state():
                 "keyword": "",
                 "marker": "",
                 "interval": 300,
-                "last_rank": None,
+                "last_rank": None,       # 기본(자연) 순위만 저장
                 "last_check": 0.0,
             },
             "review_watch": {
@@ -318,7 +320,10 @@ def send_ctx(ctx, text):
         cid = int(CHAT_ID)
     except:
         cid = CHAT_ID
-    ctx.bot.send_message(chat_id=cid, text=text, reply_markup=MAIN_KB(cid))
+    try:
+        ctx.bot.send_message(chat_id=cid, text=text, reply_markup=MAIN_KB(cid))
+    except:
+        pass
 
 def pretty_sym(sym: str) -> str:
     sym = sym.upper()
@@ -395,7 +400,7 @@ def view_block(mkt, info, cur):
     )
     return head + "\n" + line1 + "\n" + line2
 
-# ========= HOTEL (10문단 조합) =========
+# ========= HOTEL (랜덤 후기 3줄) =========
 REVIEWS = [
     [
         "{휴가기간|일주일|며칠|주말} 동안 맡겼는데 너무 좋았어요!",
@@ -478,8 +483,8 @@ HELP = (
     "• 광고시간 : 'HH:MM/입찰가' 형식 시간표 설정\n"
     "• 광고자동 : 시간표 자동 적용 켜기/끄기\n"
     "• 입찰추정 : 1순위 추정 입찰가 자동 탐색\n"
-    "• 노출감시 : 플레이스 순위 변동 실시간 감시 (광고 제외)\n"
-    "• 노출현황 : 현재 플레이스 순위를 즉시 1회 조회 (광고 제외)\n"
+    "• 노출감시 : 플레이스 순위 변동 실시간 감시 (광고/기본 순위 함께 표시)\n"
+    "• 노출현황 : 현재 플레이스 순위를 즉시 1회 조회 (광고/기본 순위 함께 표시)\n"
     "• 리뷰감시 : NAVER_PLACE_ID 기준 신규 리뷰 감시\n"
     "• 리뷰현황 : 현재 리뷰 개수를 즉시 1회 조회\n"
     "\n"
@@ -745,7 +750,161 @@ def naver_set_bid(new_bid: int):
 # ========= NAVER 검색 URL =========
 def _naver_search_url(keyword: str) -> str:
     q = urllib.parse.quote(keyword)
-    return f"https://search.naver.com/search.naver?where=place&sm=tab_jum&query={q}"
+    # 최신 place 검색 탭 기준
+    return f"https://search.naver.com/search.naver?where=place&sm=tab_nx.place&query={q}"
+
+# ========= APOLLO STATE 파서 & 순위 계산 =========
+def _extract_js_object(s: str, start_idx: int):
+    depth = 0
+    in_str = False
+    esc = False
+    started = False
+    for i in range(start_idx, len(s)):
+        ch = s[i]
+        if not started:
+            if ch == "{":
+                started = True
+                depth = 1
+            else:
+                continue
+            continue
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start_idx:i+1]
+    return None
+
+def _extract_apollo_state(html: str):
+    idx = html.find("__APOLLO_STATE__")
+    if idx < 0:
+        return None
+    brace = html.find("{", idx)
+    if brace < 0:
+        return None
+    obj = _extract_js_object(html, brace)
+    if not obj:
+        return None
+    js = (
+        obj.replace("undefined", "null")
+           .replace("!0", "true")
+           .replace("!1", "false")
+    )
+    try:
+        return json.loads(js)
+    except Exception as e:
+        print("[NAVER] __APOLLO_STATE__ JSON 파싱 실패:", e)
+        return None
+
+def _normalize(s: str) -> str:
+    return re.sub(r"\s+", "", str(s or ""))
+
+def _match_name(name: str, marker: str) -> bool:
+    if not name or not marker:
+        return False
+    nn = _normalize(name)
+    mm = _normalize(marker)
+    if mm and mm in nn:
+        return True
+    tokens = [t for t in re.split(r"\s+", marker.strip()) if t]
+    if tokens and all(t in name for t in tokens):
+        return True
+    return False
+
+def _get_name_id(apollo, ref):
+    node = apollo.get(ref, {}) or {}
+    name = node.get("name") or node.get("businessName") or node.get("title")
+    bid = node.get("id") or node.get("businessId")
+
+    # attraction 하위에 실제 place 정보가 있을 수 있음
+    if (not name or not bid) and "attraction" in node:
+        ref2 = node["attraction"].get("__ref")
+        if ref2:
+            n2 = apollo.get(ref2, {}) or {}
+            if not name:
+                name = n2.get("name") or n2.get("businessName") or n2.get("title")
+            if not bid:
+                bid = n2.get("id") or n2.get("businessId")
+
+    if bid is not None:
+        bid = str(bid).strip()
+    return name, bid
+
+def detect_place_ranks(html: str, marker: str):
+    """
+    광고/기본 둘 다 계산:
+    - 광고 순위: adBusinesses(...) 순서
+    - 기본 순위: attractions(...).businesses(...).items 순서
+    반환: {"ad": ad_rank or None, "organic": organic_rank or None} 또는 None
+    """
+    if not marker:
+        return None
+
+    apollo = _extract_apollo_state(html)
+    if not apollo:
+        return None
+
+    root = apollo.get("ROOT_QUERY", {})
+
+    # 광고 순위
+    ad_rank = None
+    ad_key = next((k for k in root.keys() if k.startswith("adBusinesses(")), None)
+    if ad_key:
+        try:
+            ad_items = root[ad_key].get("items", [])
+            idx = 0
+            for it in ad_items:
+                ref = it.get("__ref")
+                if not ref:
+                    continue
+                name, _ = _get_name_id(apollo, ref)
+                if not name:
+                    continue
+                idx += 1
+                if ad_rank is None and _match_name(name, marker):
+                    ad_rank = idx
+        except Exception as e:
+            print("[NAVER] adBusinesses 파싱 실패:", e)
+
+    # 기본 순위
+    org_rank = None
+    att_key = next((k for k in root.keys() if k.startswith("attractions(")), None)
+    if att_key:
+        att = root.get(att_key, {})
+        biz_key = next((k for k in att.keys() if k.startswith("businesses(")), None)
+        if biz_key:
+            biz = att.get(biz_key, {})
+            items = biz.get("items", [])
+            idx = 0
+            for it in items:
+                ref = it.get("__ref")
+                if not ref:
+                    continue
+                name, _ = _get_name_id(apollo, ref)
+                if not name:
+                    continue
+                idx += 1
+                if org_rank is None and _match_name(name, marker):
+                    org_rank = idx
+
+    if ad_rank is None and org_rank is None:
+        return None
+
+    return {"ad": ad_rank, "organic": org_rank}
+
+def _fmt_rank(v):
+    return f"{v}위" if isinstance(v, int) and v > 0 else "정보 없음"
 
 # ========= NAVER STATUS / SCHEDULE =========
 def send_naver_status(update):
@@ -795,7 +954,7 @@ def send_naver_status(update):
     if rw.get("enabled"):
         lines.append(
             f"- 노출감시: ON (키워드 '{rw.get('keyword','')}', "
-            f"간격 {rw.get('interval',300)}초, 최근 순위 {rw.get('last_rank')}위, 광고 제외)"
+            f"간격 {rw.get('interval',300)}초, 최근 기본 순위 {_fmt_rank(rw.get('last_rank'))})"
         )
     else:
         lines.append("- 노출감시: OFF")
@@ -822,7 +981,7 @@ def naver_schedule_loop(context):
     if not schedules:
         return
 
-    now = datetime.now()
+    now = datetime.now(KST)
     current_hm = now.strftime("%H:%M")
     today = now.strftime("%Y-%m-%d")
 
@@ -846,7 +1005,7 @@ def naver_schedule_loop(context):
             except:
                 pass
 
-# ========= NAVER 입찰추정 루프(기존) =========
+# ========= NAVER 입찰추정 (기존 로직) =========
 def detect_ad_position(html: str, marker: str):
     if not marker:
         return None
@@ -993,100 +1152,10 @@ def naver_abtest_loop(context):
         except:
             pass
 
-# ========= NAVER 노출감시 (광고 제외 플레이스) =========
-def is_ad_block(block: str) -> bool:
-    if re.search(r'data-adid=|"ad_flag"|_ad_|"link_ad"', block, re.I):
-        return True
-    if re.search(r'"chargeInfo"\s*:\s*"AD"', block):
-        return True
-    if re.search(r'aria-label="광고"', block):
-        return True
-    return False
-
-def _strip_tags(text: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"&[a-zA-Z]+;", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-def _normalize_no_space(text: str) -> str:
-    return re.sub(r"\s+", "", text)
-
-def detect_place_rank_no_ads(html: str, marker: str):
-    """
-    네이버 플레이스 검색 결과에서 광고 블록 제외 후,
-    marker 기반으로 매장 순위 계산.
-    - marker: '두젠틀 애견카페 강남' 또는 일부만 넣어도 매칭되도록 처리
-    """
-    if not marker:
-        return None
-
-    marker = marker.strip()
-    if not marker:
-        return None
-
-    marker_no_space = _normalize_no_space(marker)
-    marker_words = [w for w in marker.split() if w]
-
-    # 후보 블록 추출
-    blocks = []
-    pattern = (
-        r'(<li[^>]+(?:place_item|data-cid=)[^>]*>.*?</li>)'
-        r'|(<div[^>]+(?:place_item|data-cid=)[^>]*>.*?</div>)'
-    )
-    for m in re.finditer(pattern, html, re.S):
-        blk = m.group(0)
-        blocks.append((m.start(), blk))
-
-    # place_bluelink 기반 fallback
-    if not blocks:
-        for m in re.finditer(r'class="place_bluelink"', html):
-            s = html.rfind("<", 0, m.start())
-            e_li = html.find("</li>", m.end())
-            e_div = html.find("</div>", m.end())
-            cand = [x for x in (e_li, e_div) if x != -1]
-            if s != -1 and cand:
-                e = min(cand)
-                blk = html[s:e+6]
-                blocks.append((s, blk))
-
-    if not blocks:
-        return None
-
-    blocks.sort(key=lambda x: x[0])
-
-    organic = [(pos, blk) for pos, blk in blocks if not is_ad_block(blk)]
-    if not organic:
-        return None
-
-    # 1차: marker / 단어 / 공백제거 문자열 기반 매칭
-    for idx, (_, blk) in enumerate(organic, start=1):
-        txt = _strip_tags(blk)
-        txt_no_space = _normalize_no_space(txt)
-
-        if marker in txt:
-            return idx
-        if marker_no_space and marker_no_space in txt_no_space:
-            return idx
-        if marker_words and all(w in txt for w in marker_words):
-            return idx
-
-    # 2차: 검색 전체 html에서 marker 위치 기준으로 순위 추정
-    pos_in_html = html.find(marker)
-    if pos_in_html < 0:
-        return None
-
-    rank = 0
-    for pos, blk in organic:
-        if pos >= pos_in_html:
-            break
-        rank += 1
-
-    return rank if rank > 0 else None
-
+# ========= NAVER 노출감시 (광고/기본 동시 확인) =========
 def naver_rank_watch_loop(context):
     nav = state.setdefault("naver", {})
-    cfg = nav.get("rank_watch", {})
+    cfg = nav.setdefault("rank_watch", {})
     if not cfg.get("enabled"):
         return
 
@@ -1104,97 +1173,156 @@ def naver_rank_watch_loop(context):
     html = ""
     try:
         url = _naver_search_url(keyword)
-        r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
+        r = requests.get(url, headers=NAVER_HEADERS, timeout=10)
         html = r.text
     except Exception as e:
         print("[NAVER] 노출감시 조회 실패:", e)
-
-    pos = detect_place_rank_no_ads(html, marker) if html else None
-    prev = cfg.get("last_rank")
+        return
 
     cfg["last_check"] = now
 
-    if pos is not None:
-        if prev is None:
+    res = detect_place_ranks(html, marker) if html else None
+    if not res:
+        print("[NAVER] 노출감시: 지정 문구 결과 없음")
+        save_state()
+        return
+
+    ad_rank = res.get("ad")
+    org_rank = res.get("organic")
+    prev_org = cfg.get("last_rank")
+
+    if org_rank is not None:
+        if prev_org is None:
             try:
                 send_ctx(
                     context,
-                    f"📡 [노출감시 시작]\n키워드 '{keyword}' 현재 순위: {pos}위 (광고 제외)"
+                    f"📡 [노출감시 시작]\n"
+                    f"키워드 '{keyword}'\n"
+                    f"광고 : {_fmt_rank(ad_rank)}\n"
+                    f"기본 : {_fmt_rank(org_rank)} (광고 제외)"
                 )
             except:
                 pass
-        elif pos != prev:
+        elif org_rank != prev_org:
             try:
                 send_ctx(
                     context,
-                    f"📡 [노출감시] 순위 변경\n키워드 '{keyword}': {prev}위 → {pos}위 (광고 제외)"
+                    f"📡 [노출감시] 순위 변경\n"
+                    f"키워드 '{keyword}'\n"
+                    f"이전 기본 : {_fmt_rank(prev_org)} → 현재 기본 : {_fmt_rank(org_rank)}\n"
+                    f"광고 : {_fmt_rank(ad_rank)}"
                 )
             except:
                 pass
-        cfg["last_rank"] = pos
-    else:
-        print("[NAVER] 노출감시: marker 결과 없음")
+        cfg["last_rank"] = org_rank
 
     save_state()
 
 # ========= NAVER 리뷰감시 =========
-def _extract_int_by_key(html: str, key: str):
-    m = re.search(rf'"{key}"\s*:\s*(\d+)', html)
-    return int(m.group(1)) if m else None
+def _parse_review_count_from_html(html: str):
+    """
+    네이버 플레이스 최신 구조 기준 리뷰 수 파싱.
+    1순위: __APOLLO_STATE__ 내 VisitorReviewStatsResult / PlaceDetailBase에서 추출
+    2순위: 예전 JSON/텍스트 패턴 정규식 (하위 호환)
+    """
+
+    # 1) __APOLLO_STATE__ 기반 파싱 (최신 구조)
+    apollo = _extract_apollo_state(html)
+    if apollo:
+        candidates = []
+
+        for v in apollo.values():
+            if not isinstance(v, dict):
+                continue
+            typ = v.get("__typename")
+
+            # VisitorReviewStatsResult 노드
+            if typ == "VisitorReviewStatsResult":
+                review = v.get("review") or {}
+                if isinstance(review, dict):
+                    c = review.get("totalCount") or review.get("allCount")
+                    if isinstance(c, (int, float)):
+                        candidates.append(int(c))
+
+                for field in ["visitorReviewsTotal", "ratingReviewsTotal"]:
+                    c = v.get(field)
+                    if isinstance(c, (int, float)):
+                        candidates.append(int(c))
+
+            # PlaceDetailBase 노드
+            if typ == "PlaceDetailBase":
+                for field in [
+                    "visitorReviewsTotal",
+                    "visitorReviewsTextReviewTotal",
+                    "reviewCount",
+                    "totalReviewCount",
+                ]:
+                    c = v.get(field)
+                    if isinstance(c, (int, float)):
+                        candidates.append(int(c))
+
+        # 후보 값들 중 최대값을 리뷰 총합으로 사용
+        if candidates:
+            return max(candidates)
+
+    # 2) 예전/예비 패턴 (하위 호환용)
+    mv = re.search(r'"visitorReviewCount"\s*:\s*(\d+)', html)
+    mb = re.search(r'"blogReviewCount"\s*:\s*(\d+)', html)
+    if mv or mb:
+        v = int(mv.group(1)) if mv else 0
+        b = int(mb.group(1)) if mb else 0
+        if v or b:
+            return v + b
+
+    mv = re.search(r"방문자\s*리뷰\s*([0-9,]+)", html)
+    mb = re.search(r"블로그\s*리뷰\s*([0-9,]+)", html)
+    if mv or mb:
+        v = int(mv.group(1).replace(",", "")) if mv else 0
+        b = int(mb.group(1).replace(",", "")) if mb else 0
+        if v or b:
+            return v + b
+
+    mt = re.search(r'"totalReviewCount"\s*:\s*(\d+)', html)
+    if mt:
+        return int(mt.group(1))
+
+    # "리뷰 123건" 같은 일반 패턴 (최후 보정)
+    ml = re.search(r"리뷰\s*([0-9,]+)\s*건", html)
+    if ml:
+        return int(ml.group(1).replace(",", ""))
+
+    return None
 
 def get_place_review_count():
-    """
-    NAVER_PLACE_ID 기준 실제 리뷰 수 합산.
-    우선순위:
-      1) visitorReviewCount + blogReviewCount
-      2) '방문자 리뷰 X · 블로그 리뷰 Y' 텍스트 합
-      3) totalReviewCount
-    실패 시 None
-    """
     if not NAVER_PLACE_ID:
         return None
 
-    texts = []
-    paths = ["", "/review", "/review/visitor"]
-    for p in paths:
+    urls = [
+        f"https://m.place.naver.com/place/{NAVER_PLACE_ID}",
+        f"https://map.naver.com/p/entry/place/{NAVER_PLACE_ID}",
+        f"https://pcmap.place.naver.com/restaurant/{NAVER_PLACE_ID}/home",
+    ]
+
+    for url in urls:
         try:
-            url = f"https://m.place.naver.com/place/{NAVER_PLACE_ID}{p}"
-            r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
-            if r.status_code == 200:
-                texts.append(r.text)
+            r = requests.get(url, headers=NAVER_HEADERS, timeout=10)
         except Exception as e:
-            print("[NAVER] 리뷰 수 조회 실패:", e)
-    if not texts:
-        return None
+            print(f"[NAVER] 리뷰 URL 요청 실패: {url} :: {e}")
+            continue
 
-    html = "\n".join(texts)
+        try:
+            cnt = _parse_review_count_from_html(r.text)
+            if cnt is not None:
+                return cnt
+        except Exception as e:
+            print(f"[NAVER] 리뷰 파싱 실패: {url} :: {e}")
 
-    # 1) visitor + blog
-    v = _extract_int_by_key(html, "visitorReviewCount")
-    b = _extract_int_by_key(html, "blogReviewCount")
-    if v is not None or b is not None:
-        return (v or 0) + (b or 0) or None
-
-    # 2) '방문자 리뷰 X · 블로그 리뷰 Y'
-    m_v = re.search(r"방문자\s*리뷰[^0-9]*([0-9,]+)", html)
-    m_b = re.search(r"블로그\s*리뷰[^0-9]*([0-9,]+)", html)
-    if m_v or m_b:
-        vv = int(m_v.group(1).replace(",", "")) if m_v else 0
-        bb = int(m_b.group(1).replace(",", "")) if m_b else 0
-        if vv or bb:
-            return vv + bb
-
-    # 3) totalReviewCount
-    total = _extract_int_by_key(html, "totalReviewCount")
-    if total is not None:
-        return total
-
-    print("[NAVER] 리뷰 수 파싱 실패")
     return None
+
 
 def naver_review_watch_loop(context):
     nav = state.setdefault("naver", {})
-    cfg = nav.get("review_watch", {})
+    cfg = nav.setdefault("review_watch", {})
     if not cfg.get("enabled"):
         return
     if not NAVER_PLACE_ID:
@@ -1211,7 +1339,7 @@ def naver_review_watch_loop(context):
     cfg["last_check"] = now
 
     if cnt is None:
-        print("[NAVER] 리뷰감시: 리뷰 수 없음/파싱 실패")
+        print("[NAVER] 리뷰감시: 리뷰 수 파싱 실패")
         save_state()
         return
 
@@ -1222,7 +1350,7 @@ def naver_review_watch_loop(context):
         try:
             send_ctx(
                 context,
-                f"⭐️ [리뷰감시 시작] 현재 리뷰 {cnt}건 기준으로 감시합니다."
+                f"⭐️ [리뷰감시 시작]\n현재 리뷰 {cnt}건 기준으로 감시합니다."
             )
         except:
             pass
@@ -1235,50 +1363,12 @@ def naver_review_watch_loop(context):
         try:
             send_ctx(
                 context,
-                f"⭐️ [리뷰감시] 신규 리뷰 {diff}건 추가 (총 {cnt}건)"
+                f"⭐️ [리뷰감시]\n신규 리뷰 {diff}건 추가 (총 {cnt}건)"
             )
         except:
             pass
     else:
         save_state()
-
-# ========= 즉시 조회 =========
-def naver_rank_check_once(update):
-    nav = state.setdefault("naver", {})
-    cfg = nav.setdefault("rank_watch", {})
-    keyword = (cfg.get("keyword") or "").strip()
-    marker = (cfg.get("marker") or "").strip()
-
-    if not (keyword and marker):
-        reply(
-            update,
-            "노출감시 설정이 되어 있지 않습니다.\n"
-            "먼저 '노출감시' 명령으로 키워드와 식별 문구를 설정해 주세요."
-        )
-        return
-
-    try:
-        url = _naver_search_url(keyword)
-        r = requests.get(url, headers=NAVER_HEADERS, timeout=5)
-        html = r.text
-        pos = detect_place_rank_no_ads(html, marker)
-    except Exception as e:
-        print("[NAVER] 노출현황 조회 실패:", e)
-        reply(update, "노출현황 조회 중 오류가 발생했습니다.")
-        return
-
-    if pos is None:
-        reply(
-            update,
-            f"노출현황: 키워드 '{keyword}' 결과에서 지정한 문구를 찾지 못했습니다."
-        )
-    else:
-        cfg["last_rank"] = pos
-        save_state()
-        reply(
-            update,
-            f"노출현황: 키워드 '{keyword}' 기준 현재 순위는 {pos}위입니다. (광고 제외)"
-        )
 
 def naver_review_check_once(update):
     if not NAVER_PLACE_ID:
@@ -1295,6 +1385,54 @@ def naver_review_check_once(update):
     cfg["last_count"] = cnt
     save_state()
     reply(update, f"리뷰현황: 현재 네이버 플레이스 리뷰는 총 {cnt}건입니다.")
+
+# ========= 즉시 노출 조회 =========
+def naver_rank_check_once(update):
+    nav = state.setdefault("naver", {})
+    cfg = nav.setdefault("rank_watch", {})
+
+    keyword = (cfg.get("keyword") or "").strip()
+    marker = (cfg.get("marker") or "").strip()
+
+    if not (keyword and marker):
+        reply(
+            update,
+            "노출감시 설정이 되어 있지 않습니다.\n"
+            "먼저 '노출감시' 명령으로 키워드와 식별 문구를 설정해 주세요."
+        )
+        return
+
+    try:
+        url = _naver_search_url(keyword)
+        r = requests.get(url, headers=NAVER_HEADERS, timeout=10)
+        html = r.text
+        res = detect_place_ranks(html, marker)
+    except Exception as e:
+        print("[NAVER] 노출현황 조회 실패:", e)
+        reply(update, "노출현황 조회 중 오류가 발생했습니다.")
+        return
+
+    if not res:
+        reply(
+            update,
+            "📡 노출현황 알림\n"
+            f"🔍 키워드: '{keyword}'\n"
+            "⚠️ 검색 결과에서 지정한 매장을 찾지 못했습니다.\n"
+            "설정하신 키워드/문구를 다시 한 번 확인해 주세요."
+        )
+    else:
+        ad_rank = res.get("ad")
+        org_rank = res.get("organic")
+        if org_rank is not None:
+            cfg["last_rank"] = org_rank
+            save_state()
+        reply(
+            update,
+           "📡 노출현황 알림\n"
+        f"🔍 키워드: '{keyword}'\n"
+        f"💚 광고 노출: {_fmt_rank(ad_rank)}\n"
+        f"📍 기본 노출: {_fmt_rank(org_rank)} (광고 제외)"
+        )
 
 # ========= INLINE MODE HANDLER =========
 def on_mode_select(update, context):
@@ -1373,7 +1511,7 @@ def on_text(update, context):
                     "setqty":"수량",
                     "setrate_coin":"임계값(%)"
                 }[action]
-                reply(update, f"{symbol} {label} 값을 숫자로 입력하세요.", kb=CANCEL_KB)
+            reply(update, f"{symbol} {label} 값을 숫자로 입력하세요.", kb=CANCEL_KB)
             return
 
         if step == "value" and action in ["setavg","setqty","setrate_coin"]:
@@ -1631,7 +1769,7 @@ def on_text(update, context):
                 cfg["last_check"] = 0.0
                 save_state()
                 clear_pending(cid)
-                reply(update, f"노출감시를 시작합니다. (간격 {sec}초, 광고 제외 순위 기준)")
+                reply(update, f"노출감시를 시작합니다. (간격 {sec}초, 광고/기본 순위 모두 확인)")
                 return
 
     # ===== 기본 명령 처리 =====
@@ -1726,6 +1864,15 @@ def on_text(update, context):
         return
 
     # 리뷰감시: 리뷰감시 [분], 리뷰감시중지
+    if head in ["리뷰감시중지", "리뷰중지", "리뷰감시끄기"]:
+        nav = state.setdefault("naver", {})
+        cfg = nav.setdefault("review_watch", {})
+        cfg["enabled"] = False
+        save_state()
+        reply(update, "리뷰감시를 중지했습니다.")
+        return
+
+    # 리뷰감시: 리뷰감시 [분]
     if head.startswith("리뷰감시"):
         nav = state.setdefault("naver", {})
         cfg = nav.setdefault("review_watch", {})
@@ -1740,16 +1887,8 @@ def on_text(update, context):
         cfg["enabled"] = True
         cfg["last_check"] = 0.0
         save_state()
-        iv = int(cfg.get("interval",180))
+        iv = int(cfg.get("interval", 180))
         reply(update, f"리뷰감시를 시작합니다. {iv//60}분 간격으로 확인합니다.")
-        return
-
-    if head in ["리뷰감시중지","리뷰중지","리뷰감시끄기"]:
-        nav = state.setdefault("naver", {})
-        cfg = nav.setdefault("review_watch", {})
-        cfg["enabled"] = False
-        save_state()
-        reply(update, "리뷰감시를 중지했습니다.")
         return
 
     if head in ["리뷰현황","리뷰조회","리뷰상태"]:
@@ -1890,21 +2029,19 @@ def main():
     dp.add_handler(MessageHandler(Filters.text & (~Filters.command), on_text))
     dp.add_handler(MessageHandler(Filters.command, on_text))
 
+    # Job queues
     up.job_queue.run_repeating(check_loop, interval=3, first=3)
     up.job_queue.run_repeating(naver_schedule_loop, interval=30, first=10)
     up.job_queue.run_repeating(naver_abtest_loop, interval=15, first=15)
-    up.job_queue.run_repeating(naver_rank_watch_loop, interval=30, first=20)
-    up.job_queue.run_repeating(naver_review_watch_loop, interval=30, first=40)
+    up.job_queue.run_repeating(naver_rank_watch_loop, interval=60, first=20)
+    up.job_queue.run_repeating(naver_review_watch_loop, interval=60, first=40)
 
     def hi(ctx):
         try:
             if CHAT_ID:
                 send_ctx(
                     ctx,
-                    "봇이 시작되었습니다. '메뉴' 키로 모드를 선택하세요.\n"
-                    "- 코인: 보기/상태/코인/지정가\n"
-                    "- 네이버: 광고상태/광고설정/광고시간/광고자동/입찰추정/"
-                    "노출감시/리뷰감시/노출현황/리뷰현황 (광고 제외 순위 기준)"
+                    "김비서 출근했어요 💖"
                 )
         except:
             pass

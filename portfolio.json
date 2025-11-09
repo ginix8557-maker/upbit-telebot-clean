@@ -4,7 +4,7 @@
     "KRW-SOL": {
       "avg_price": 289263.0,
       "qty": 89.80100443,
-      "last_notified_price": 238600.0,
+      "last_notified_price": 236900.0,
       "threshold_pct": 0.2,
       "target_price": null,
       "triggers": [
@@ -13,15 +13,15 @@
         250000.0,
         250000.0
       ],
-      "prev_price": 238400.0
+      "prev_price": 237200.0
     },
     "KRW-XRP": {
       "avg_price": 4131.1,
       "qty": 2183.33692558,
       "threshold_pct": 0.5,
-      "last_notified_price": 3456.0,
+      "last_notified_price": 3386.0,
       "triggers": [],
-      "prev_price": 3456.0
+      "prev_price": 3388.0
     },
     "KRW-TRX": {
       "avg_price": 420.0,
@@ -35,8 +35,8 @@
       "avg_price": 0.0,
       "qty": 0.0,
       "threshold_pct": 0.2,
-      "last_notified_price": 154346000.0,
-      "prev_price": 154435000.0,
+      "last_notified_price": 152236000.0,
+      "prev_price": 152141000.0,
       "triggers": []
     }
   },
@@ -51,5 +51,46 @@
     "poll_interval_sec": 2,
     "last_push_ts": {}
   },
-  "pending": {}
+  "pending": {},
+  "naver": {
+    "auto_enabled": true,
+    "schedules": [
+      {
+        "time": "11:00",
+        "bid": 310
+      },
+      {
+        "time": "20:00",
+        "bid": 50
+      }
+    ],
+    "last_applied": "2025-11-09 20:00 50",
+    "last_known_bid": 50,
+    "adgroup_id": "grp-a001-06-000000029750049",
+    "abtest": null,
+    "rank_watch": {
+      "enabled": true,
+      "keyword": "강남 애견카페",
+      "marker": "두젠틀",
+      "interval": 300,
+      "last_rank": 3,
+      "last_check": 1762691424.576988,
+      "last_rank_ads": 1,
+      "last_rank_org": 3
+    },
+    "review_watch": {
+      "enabled": true,
+      "interval": 180,
+      "last_count": 530,
+      "last_check": 1762691444.577141,
+      "last_visitor": 529,
+      "last_blog": null,
+      "last_total": 529,
+      "last_visitor_ids": [],
+      "last_blog_ids": []
+    }
+  },
+  "modes": {
+    "1109405479": "naver"
+  }
 }
