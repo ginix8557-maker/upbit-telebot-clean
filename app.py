@@ -1,5 +1,4 @@
 # app.py
-python
 try:
     import pkg_resources
 except ImportError:
