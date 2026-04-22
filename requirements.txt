@@ -1,4 +1,4 @@
-setuptools
+setuptools<70
 python-telegram-bot==13.15
 python-dotenv
 requests==2.31.0
