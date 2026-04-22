@@ -1,4 +1,13 @@
 # app.py
+python
+try:
+    import pkg_resources
+except ImportError:
+    import types as _types, sys as _sys
+    _pkg = _types.ModuleType('pkg_resources')
+    _pkg.get_distribution = lambda name: _types.SimpleNamespace(version='unknown')
+    _pkg.DistributionNotFound = Exception
+    _sys.modules['pkg_resources'] = _pkg
 import os, json, requests, atexit, signal, threading, random, re, time, base64, hmac, hashlib, urllib.parse
 from datetime import datetime, timezone, timedelta
 KST = timezone(timedelta(hours=9))
